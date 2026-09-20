@@ -1,0 +1,76 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d009551..89e06ac 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -4346,7 +4346,7 @@ if(SDL_SHARED)
+         RESOURCE "${SDL_FRAMEWORK_RESOURCES}"
+       )
+     endif()
+-  elseif(UNIX AND NOT (ANDROID OR CYGWIN))
++  elseif(UNIX AND NOT (ANDROID OR OHOS OR CYGWIN))
+     set_target_properties(SDL3-shared PROPERTIES
+       VERSION "${SDL_SO_VERSION}"
+       SOVERSION "${SDL_SO_VERSION_MAJOR}"
+diff --git a/src/core/openharmony/SDL_openharmony.c b/src/core/openharmony/SDL_openharmony.c
+index a8b6872..4d38e96 100644
+--- a/src/core/openharmony/SDL_openharmony.c
++++ b/src/core/openharmony/SDL_openharmony.c
+@@ -1011,6 +1011,13 @@ static napi_value SDL_JS_UIAbility_OnWindowStageCreate(napi_env env, napi_callba
+     napi_value args[] = { CreateNapiString(env, "pages/Index"), CreateNapiFunction(env, NULL, SDL_JS_LoadContentResult, NULL) };
+     CallNapiMethod(env, windowStage, "loadContent", SDL_arraysize(args), args);
+ 
++    // Hide the system status bar and the navigation bar. Huawei's guidance for this is to call
++    // setWindowSystemBarEnable() during onWindowStageCreate -- which is exactly where we are, and
++    // the window reference has just been taken above. Doing it from anywhere else (a timer in the
++    // app, or the immersive-mode APIs) gets overridden by the system a moment later, which leaves
++    // the status bar drawn on top of a fullscreen game.
++    SDL_OpenHarmonyToggleSystemBars(false, false);
++
+     return GetNapiUndefined(env);
+ }
+ 
+diff --git a/src/video/openharmony/SDL_openharmonyvideo.c b/src/video/openharmony/SDL_openharmonyvideo.c
+index 63ab3db..4708365 100644
+--- a/src/video/openharmony/SDL_openharmonyvideo.c
++++ b/src/video/openharmony/SDL_openharmonyvideo.c
+@@ -70,6 +70,7 @@ void SDL_OpenHarmonyGetNativeWindowPointers(void **xcomponent, void **window)
+ 
+ void SDL_OpenHarmonyVideoSurfaceDestroyed(void *component, void *window)
+ {
++    SDL_Log("OPENHARMONY-DEBUG: OnSurfaceDestroyed component=%p window=%p", component, window);
+     SDL_assert(native_xcomponent == ((OH_NativeXComponent *) component));  // right now we assume one surface, one window.
+     native_xcomponent = NULL;
+     native_window = NULL;
+@@ -85,6 +86,7 @@ void SDL_OpenHarmonyVideoSurfaceChanged(void *component, void *window)
+ 
+ void SDL_OpenHarmonyVideoSurfaceCreated(void *component, void *window)
+ {
++    SDL_Log("OPENHARMONY-DEBUG: OnSurfaceCreated component=%p window=%p", component, window);
+     SDL_assert(native_xcomponent == NULL);  // right now we assume one surface, one window.
+     native_xcomponent = (OH_NativeXComponent *) component;
+     native_window = window;
+diff --git a/src/video/openharmony/SDL_openharmonywindow.c b/src/video/openharmony/SDL_openharmonywindow.c
+index f462d9d..d616c93 100644
+--- a/src/video/openharmony/SDL_openharmonywindow.c
++++ b/src/video/openharmony/SDL_openharmonywindow.c
+@@ -59,6 +59,7 @@ bool OPENHARMONY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Pr
+     void *voidxcomp, *native_window;
+     SDL_OpenHarmonyGetNativeWindowPointers(&voidxcomp, &native_window);
+     OH_NativeXComponent *native_xcomponent = (OH_NativeXComponent *) voidxcomp;
++    SDL_Log("OPENHARMONY-DEBUG: CreateWindow xcomponent=%p native_window=%p", (void *) native_xcomponent, native_window);
+     if (!native_xcomponent || !native_window) {
+         result = SDL_SetError("Don't have Native XComponent or Native Window");
+         goto endfunction;
+@@ -114,6 +115,12 @@ bool OPENHARMONY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Pr
+     window->internal = data;
+     OPENHARMONY_Window = window;
+ 
++    // Hide the system bars again now that the app's window exists. The same call is made from
++    // SDL_JS_UIAbility_OnWindowStageCreate (Huawei's documented place for it), but the system
++    // appears to restore the status bar a couple of seconds into startup -- this second call is
++    // late enough that it should be the last thing to touch that state.
++    SDL_OpenHarmonyToggleSystemBars(false, false);
++
+ endfunction:
+ 
+     // !!! FIXME: Android has locking here; maybe it isn't necessary for OpenHarmony? What happens if we're in a background thread?

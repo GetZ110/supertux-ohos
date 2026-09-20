@@ -1,0 +1,674 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 93ffb84..4b1d50c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -117,14 +117,14 @@ endif()
+ option(SUPERTUX_LTO "Use link-time optimizations (Takes more RAM at compilation, gives smaller and faster executables)" OFF)
+ 
+ # Mobile builds
+-if(ANDROID)
++if(ANDROID OR OHOS)
+   option(HIDE_NONMOBILE_OPTIONS "Hide options that are impractical on mobile devices (e. g. changing screen resolution)" ON)
+ else()
+   option(HIDE_NONMOBILE_OPTIONS "Hide options that are impractical on mobile devices (e. g. changing screen resolution)" OFF)
+ endif()
+ 
+ ## Determine whether static linking for SimpleSquirrel should be defaulted to
+-if(MSVC OR ANDROID OR EMSCRIPTEN)
++if(MSVC OR ANDROID OR OHOS OR EMSCRIPTEN)
+   option(USE_STATIC_SIMPLESQUIRREL "Statically link the SimpleSquirrel library" ON)
+ else()
+   option(USE_STATIC_SIMPLESQUIRREL "Statically link the SimpleSquirrel library" OFF)
+@@ -320,6 +320,15 @@ include(SuperTux/CompileAmalgation)
+ ## Add target for supertux binary
+ if(ANDROID)
+   add_library(supertux2 SHARED ${CMAKE_BINARY_DIR}/version.h ${SUPERTUX_SOURCES_C} ${SUPERTUX_SOURCES_CXX} ${SUPERTUX_SOURCES_HXX} src/main.cpp)
++elseif(OHOS)
++  # HarmonyOS cannot install an executable: SDL gains control of the app and then loads
++  # libmain.so, driving it through the SDL main callbacks. So there is no src/main.cpp here
++  # (it defines main(), which SDL renames to SDL_main on this platform and then never calls);
++  # src/ohos/main_ohos.cpp -- picked up by the src/*/*.cpp glob above -- provides
++  # SDL_AppInit/SDL_AppIterate/SDL_AppEvent/SDL_AppQuit instead, and the output is named
++  # libmain.so so that SDL finds it.
++  add_library(supertux2 SHARED ${CMAKE_BINARY_DIR}/version.h ${SUPERTUX_SOURCES_C} ${SUPERTUX_SOURCES_CXX} ${SUPERTUX_SOURCES_HXX})
++  # The OUTPUT_NAME for this target is set further down (see the OHOS case there).
+ else()
+   add_executable(supertux2 ${SUPERTUX_WIN32_OPTION} ${CMAKE_BINARY_DIR}/version.h ${SUPERTUX_SOURCES_C} ${SUPERTUX_SOURCES_CXX} ${SUPERTUX_SOURCES_HXX} ${SUPERTUX_RESOURCES} src/main.cpp)
+ endif()
+@@ -414,6 +423,10 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+ endif()
+ 
+ set_target_properties(supertux2 PROPERTIES OUTPUT_NAME "supertux2")
++if(OHOS)
++  # SDL on HarmonyOS looks for libmain.so and drives it through the SDL main callbacks.
++  set_target_properties(supertux2 PROPERTIES OUTPUT_NAME main)
++endif()
+ set_target_properties(supertux2 PROPERTIES COMPILE_FLAGS "${SUPERTUX2_EXTRA_WARNING_FLAGS}")
+ 
+ # FIXME: As of writing, Emscripten fails with "wasm-ld: error: /path/to/emsdk/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten/thinlto/libc.a(fileno.o): attempt to add bitcode file after LTO (fileno)"
+diff --git a/src/supertux/gameconfig.cpp b/src/supertux/gameconfig.cpp
+index 9d88e52..4795008 100644
+--- a/src/supertux/gameconfig.cpp
++++ b/src/supertux/gameconfig.cpp
+@@ -54,6 +54,11 @@ Config::Config() :
+ #ifdef __ANDROID__
+   use_fullscreen(true),
+ #else
++  // NOTE: HarmonyOS deliberately stays "windowed" here. SDL's OpenHarmony fullscreen path
++  // (OPENHARMONY_SetWindowFullscreen -> setSystemBarEnable) hides the status/navigation bars but
++  // has a FIXME about not resizing the XComponent afterwards, which leaves the frame buffer
++  // rotated/squeezed. The ArkTS shell hides the bars instead (see supertux-ohos EntryAbility.ets)
++  // and lets the window fill the display, so SDL never has to switch modes.
+   use_fullscreen(false),
+ #endif
+   video(VideoSystem::VIDEO_SDL),
+diff --git a/src/supertux/main.cpp b/src/supertux/main.cpp
+index 6dfd1f4..7418e73 100644
+--- a/src/supertux/main.cpp
++++ b/src/supertux/main.cpp
+@@ -222,6 +222,34 @@ void PhysfsSubsystem::find_mount_datadir()
+     return;
+ #endif
+ 
++#ifdef __OHOS__
++    /* HarmonyOS: the ArkTS shell extracts the HAP's resources/rawfile/data.zip into the
++       user directory before it hands control to SDL, because PhysFS cannot read the
++       package's rawfile space. Mount that copy; if it is not there (e.g. the extraction
++       failed), fall back to copying it through SDL's RawFile APIs like Android does. */
++    {
++      const std::string newzip = FileSystem::join(m_forced_userdir.value_or(""), "data.zip");
++      if (FileSystem::exists(newzip))
++      {
++        SDL_Log("[supertux] assets: mounting the extracted copy %s", newzip.c_str());
++        if (!PHYSFS_mount(newzip.c_str(), nullptr, 1))
++        {
++          SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[supertux] assets: PHYSFS_mount('%s') failed: %s",
++                       newzip.c_str(), PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
++        }
++        return;
++      }
++      SDL_Log("[supertux] assets: no extracted copy at %s, trying the package's rawfile space", newzip.c_str());
++    }
++
++    if (!setup_android_datadir())
++    {
++      log_warning << "Couldn't setup HarmonyOS assets: " << PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()) << std::endl;
++    }
++
++    return;
++#endif
++
+   if (m_forced_datadir)
+   {
+     m_datadir = *m_forced_datadir;
+@@ -441,6 +469,18 @@ PhysfsSubsystem::setup_android_datadir() const
+ 
+   size_t zipsz;
+   void* zipdata = SDL_LoadFile(zippath.c_str(), &zipsz);
++#ifdef __OHOS__
++  SDL_Log("[supertux] assets: SDL_LoadFile(\"%s\") -> %p (%zu bytes); user copy %s",
++          zippath.c_str(), zipdata, zipsz, newzip.c_str());
++#endif
++
++  if (!zipdata)
++  {
++#ifdef __OHOS__
++    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[supertux] assets: cannot read data.zip from the package: %s", SDL_GetError());
++#endif
++    return false;
++  }
+ 
+   bool newdata = true;
+   if (FileSystem::exists(newzip)) {
+@@ -468,6 +508,10 @@ PhysfsSubsystem::setup_android_datadir() const
+   SDL_free(zipdata);
+ 
+   PHYSFS_mount(newzip.c_str(), nullptr, 1);
++#ifdef __OHOS__
++  SDL_Log("[supertux] assets: PHYSFS_mount(\"%s\") %s", newzip.c_str(),
++          PHYSFS_getLastErrorCode() == PHYSFS_ERR_OK ? "ok" : PHYSFS_getErrorByCode(PHYSFS_getLastErrorCode()));
++#endif
+ 
+   return true;
+ }
+@@ -492,7 +536,7 @@ SDLSubsystem::SDLSubsystem()
+     throw std::runtime_error(msg.str());
+   }
+ 
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(__OHOS__)
+   int num_touch_devices;
+   SDL_GetTouchDevices(&num_touch_devices);
+   g_config->mobile_controls = (num_touch_devices > 0);
+@@ -732,7 +776,62 @@ Main::launch_game(const CommandLineArguments& args)
+     }
+   }
+ 
+-  m_screen_manager->run();
++  /* The blocking main loop used to be started here (m_screen_manager->run()). It now lives
++     in Main::run() so that the HarmonyOS entry point can run this same setup one frame at
++     a time -- see src/ohos/main_ohos.cpp. */
++}
++
++#ifdef __OHOS__
++/* HarmonyOS: SDL_GetPrefPath() resolves to a writable, app-private directory
++   (/data/storage/el2/base/files/...), which is what PhysFS needs for the user dir. */
++static std::string
++ohos_userdir()
++{
++  char* pref = SDL_GetPrefPath("SuperTux", "supertux2");
++  std::string result = pref ? pref : "";
++  if (pref)
++  {
++    SDL_free(pref);
++  }
++  return result;
++}
++#endif
++
++bool
++Main::init_subsystems(int argc, char** argv, CommandLineArguments& args)
++{
++  try
++  {
++    args.parse_args(argc, argv);
++    g_log_level = args.get_log_level();
++    g_log_tinygettext = args.log_tinygettext;
++  }
++  catch(const std::exception& err)
++  {
++    std::cout << "Error: " << err.what() << std::endl;
++#ifdef __OHOS__
++    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[supertux] argument parsing failed: %s", err.what());
++#endif
++    return false;
++  }
++
++#if defined(__ANDROID__)
++  m_physfs_subsystem.reset(new PhysfsSubsystem(argv[0], args.datadir, SDL_GetAndroidExternalStoragePath()));
++#elif defined(__OHOS__)
++  m_physfs_subsystem.reset(new PhysfsSubsystem(argv[0], args.datadir, ohos_userdir()));
++#else
++  m_physfs_subsystem.reset(new PhysfsSubsystem(argv[0], args.datadir, args.userdir));
++#endif
++  m_physfs_subsystem->print_search_path();
++
++  s_timelog.log("config");
++  m_config_subsystem.reset(new ConfigSubsystem());
++  args.merge_into(*g_config);
++
++  s_timelog.log("tinygettext");
++  init_tinygettext();
++
++  return true;
+ }
+ 
+ int
+@@ -781,32 +880,11 @@ Main::run(int argc, char** argv)
+   {
+ #endif
+     CommandLineArguments args;
+-    try
++    if (!init_subsystems(argc, argv, args))
+     {
+-      args.parse_args(argc, argv);
+-      g_log_level = args.get_log_level();
+-      g_log_tinygettext = args.log_tinygettext;
+-    }
+-    catch(const std::exception& err)
+-    {
+-      std::cout << "Error: " << err.what() << std::endl;
+       return EXIT_FAILURE;
+     }
+ 
+-#ifdef __ANDROID__
+-    m_physfs_subsystem.reset(new PhysfsSubsystem(argv[0], args.datadir, SDL_GetAndroidExternalStoragePath()));
+-#else
+-    m_physfs_subsystem.reset(new PhysfsSubsystem(argv[0], args.datadir, args.userdir));
+-#endif
+-    m_physfs_subsystem->print_search_path();
+-
+-    s_timelog.log("config");
+-    m_config_subsystem.reset(new ConfigSubsystem());
+-    args.merge_into(*g_config);
+-
+-    s_timelog.log("tinygettext");
+-    init_tinygettext();
+-
+     switch (args.get_action())
+     {
+       case CommandLineArguments::PRINT_VERSION:
+@@ -827,6 +905,12 @@ Main::run(int argc, char** argv)
+ 
+       default:
+         launch_game(args);
++        /* The blocking loop lives here (rather than inside launch_game) so that the
++           HarmonyOS entry point can run the very same setup frame by frame. */
++        if (m_screen_manager)
++        {
++          m_screen_manager->run();
++        }
+         break;
+     }
+ #ifdef NDEBUG
+@@ -910,3 +994,113 @@ Main::release_check()
+   dialog->set_title(_("Checking for new releases..."));
+   MenuManager::instance().set_dialog(std::move(dialog));
+ }
++
++#ifdef __OHOS__
++/* ---------------------------------------------------------------------------------------
++   HarmonyOS / OpenHarmony entry points.
++
++   SDL3 on this platform cannot use an ANSI main(): SDL gains control of the app through
++   ArkTS + XComponent and then looks up SDL_AppInit/SDL_AppIterate/SDL_AppEvent/SDL_AppQuit
++   inside libmain.so (see docs/README-harmonyos.md and include/SDL3/SDL_main_impl.h in SDL).
++   src/ohos/main_ohos.cpp implements those four callbacks and drives the three functions
++   below; the desktop path (Main::run) is left exactly as it was.
++   --------------------------------------------------------------------------------------- */
++
++bool
++Main::ohos_init(int argc, char** argv)
++{
++  ErrorHandler::set_handlers();
++
++  SDL_Log("[supertux] ohos_init: parsing arguments, setting up PhysFS + config");
++
++#ifdef __OHOS__
++  // Probe how the app package's assets are reachable: RawFile lookups are what data.zip
++  // loading depends on, so log both the base path and a tiny file next to data.zip.
++  {
++    char* pref = SDL_GetPrefPath("SuperTux", "supertux2");
++    SDL_Log("[supertux] paths: base='%s' pref='%s'", SDL_GetBasePath() ? SDL_GetBasePath() : "(null)", pref ? pref : "(null)");
++    if (pref) { SDL_free(pref); }
++
++    const char* probes[] = { "rawtest.txt", "assets://rawtest.txt", "data.zip", "assets://data.zip" };
++    for (const char* probe : probes)
++    {
++      size_t sz = 0;
++      void* data = SDL_LoadFile(probe, &sz);
++      SDL_Log("[supertux] probe SDL_LoadFile('%s') -> %s (%zu bytes) %s", probe, data ? "OK" : "FAILED", sz, data ? "" : SDL_GetError());
++      if (data) { SDL_free(data); }
++    }
++  }
++#endif
++
++  CommandLineArguments args;
++  if (!init_subsystems(argc, argv, args))
++  {
++    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[supertux] ohos_init: init_subsystems() failed");
++    return false;
++  }
++
++  SDL_Log("[supertux] ohos_init: launching the game (data dir mounted)");
++  try
++  {
++    launch_game(args);
++  }
++  catch(const std::exception& err)
++  {
++    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[supertux] ohos_init: launch_game() threw: %s", err.what());
++    log_fatal << "HarmonyOS: failed to start SuperTux: " << err.what() << std::endl;
++    return false;
++  }
++  catch(...)
++  {
++    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[supertux] ohos_init: launch_game() threw an unknown exception");
++    return false;
++  }
++
++  SDL_Log("[supertux] ohos_init: ready (screen manager %s)", m_screen_manager ? "created" : "MISSING");
++
++#ifdef __OHOS__
++  if (m_video_system)
++  {
++    const Size window_size = m_video_system->get_window_size();
++    SDL_Log("[supertux] window size as SuperTux sees it: %dx%d", window_size.width, window_size.height);
++  }
++#endif
++
++  if (m_screen_manager)
++  {
++    // Same as the head of ScreenManager::run(): the initial screen is only queued by
++    // launch_game(), so apply it before we start handing out frames.
++    m_screen_manager->begin();
++    if (m_screen_manager->get_screen_stack().empty())
++    {
++      SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[supertux] ohos_init: no screen to run");
++      return false;
++    }
++    SDL_Log("[supertux] ohos_init: %d screen(s) on the stack", (int)m_screen_manager->get_screen_stack().size());
++  }
++
++  return m_screen_manager != nullptr;
++}
++
++bool
++Main::ohos_iterate()
++{
++  if (!m_screen_manager || m_screen_manager->get_screen_stack().empty())
++  {
++    return false;
++  }
++
++  // One iteration of what ScreenManager::run() does in a loop on desktop.
++  m_screen_manager->loop_iter();
++
++  return !m_screen_manager->get_screen_stack().empty();
++}
++
++void
++Main::ohos_shutdown()
++{
++  // Same tail as Main::run(): drop the dictionary manager before the subsystems go away,
++  // then let Main's destructor tear the rest down (src/ohos/main_ohos.cpp resets g_main).
++  g_dictionary_manager.reset();
++}
++#endif
+diff --git a/src/supertux/main.hpp b/src/supertux/main.hpp
+index 9fde8ae..3f23707 100644
+--- a/src/supertux/main.hpp
++++ b/src/supertux/main.hpp
+@@ -93,7 +93,21 @@ public:
+       #define main SDL_main from SDL.h */
+   int run(int argc, char** argv);
+ 
++#if defined(__OHOS__) || defined(SDL_PLATFORM_OPENHARMONY)
++  /** HarmonyOS/OpenHarmony: SDL3 on this platform only supports the SDL "main callbacks"
++      (SDL looks up SDL_AppInit/SDL_AppIterate/SDL_AppEvent/SDL_AppQuit inside libmain.so),
++      so the blocking run() loop is split into init / one frame / shutdown.
++      See src/ohos/main_ohos.cpp. */
++  bool ohos_init(int argc, char** argv);
++  bool ohos_iterate();
++  void ohos_shutdown();
++  ScreenManager* get_screen_manager() const { return m_screen_manager.get(); }
++#endif
++
+ private:
++  /** Shared by run() and ohos_init(): command line, PhysFS, config, tinygettext. */
++  bool init_subsystems(int argc, char** argv, CommandLineArguments& args);
++
+   void init_tinygettext();
+   void init_video();
+ 
+diff --git a/src/supertux/screen_manager.cpp b/src/supertux/screen_manager.cpp
+index 6dfb1a1..366e6a2 100644
+--- a/src/supertux/screen_manager.cpp
++++ b/src/supertux/screen_manager.cpp
+@@ -338,13 +338,109 @@ ScreenManager::update_gamelogic(float dt_sec)
+   Console::current()->update(dt_sec);
+ }
+ 
++#if defined(__OHOS__)
++static std::vector<SDL_Event> g_ohos_event_queue;
++static SDL_Mutex* g_ohos_event_mutex = nullptr;
++
++void
++ScreenManager::push_ohos_event(const SDL_Event& event)
++{
++  if (!g_ohos_event_mutex)
++  {
++    g_ohos_event_mutex = SDL_CreateMutex();
++  }
++
++  SDL_LockMutex(g_ohos_event_mutex);
++  g_ohos_event_queue.push_back(event);
++  SDL_UnlockMutex(g_ohos_event_mutex);
++}
++#endif
++
+ void
+ ScreenManager::process_events()
+ {
+   m_input_manager.update();
++
++#if defined(__OHOS__)
++  // Drain whatever SDL's main callbacks handed us since the last frame. This has to happen
++  // *after* InputManager::update(): that call flushes the controllers, so a control press set
++  // before it would never be seen by the menu or screen that this frame goes on to update.
++  {
++    std::vector<SDL_Event> queued;
++    if (g_ohos_event_mutex)
++    {
++      SDL_LockMutex(g_ohos_event_mutex);
++      queued.swap(g_ohos_event_queue);
++      SDL_UnlockMutex(g_ohos_event_mutex);
++    }
++    for (SDL_Event& event : queued)
++    {
++      process_event(event);
++    }
++  }
++#endif
++
+   SDL_Event event;
+-  auto session = GameSession::current();
+   while (SDL_PollEvent(&event))
++  {
++    process_event(event);
++  }
++}
++
++/** Handles one event.
++    Split out of process_events() so the HarmonyOS entry point can hand events straight to the
++    game instead of bouncing them through SDL's queue: SDL's main-callback machinery drains that
++    queue before SDL_AppIterate runs, and loop_iter() can return early (its "not enough time for a
++    game step yet" path) without polling at all, so a queue-based bridge both delays events and
++    delivers them several times. */
++void
++ScreenManager::process_event(SDL_Event event)
++{
++#ifdef __OHOS__
++  // Temporary instrumentation while bringing up HarmonyOS input.
++  {
++    const char* what = nullptr;
++    float v0 = 0.0f, v1 = 0.0f;
++    if (event.type == SDL_EVENT_FINGER_DOWN || event.type == SDL_EVENT_FINGER_MOTION || event.type == SDL_EVENT_FINGER_UP)
++    {
++      what = "finger(normalized)";
++      v0 = event.tfinger.x;
++      v1 = event.tfinger.y;
++    }
++    else if (event.type == SDL_EVENT_MOUSE_BUTTON_DOWN || event.type == SDL_EVENT_MOUSE_BUTTON_UP)
++    {
++      const Vector lp = VideoSystem::current()->get_viewport().to_logical(event.button.x, event.button.y);
++      what = "mouse-button(logical)";
++      v0 = lp.x;
++      v1 = lp.y;
++    }
++    else if (event.type == SDL_EVENT_MOUSE_MOTION)
++    {
++      const Vector lp = VideoSystem::current()->get_viewport().to_logical(event.motion.x, event.motion.y);
++      what = "mouse-motion(logical)";
++      v0 = lp.x;
++      v1 = lp.y;
++    }
++    else if (event.type == SDL_EVENT_KEY_DOWN)
++    {
++      what = "key-down";
++      v0 = (float) event.key.key;
++    }
++
++    if (what)
++    {
++      SDL_Log("[supertux] process_event %s type=0x%x v=%.2f,%.2f stack=%d",
++              what, (unsigned) event.type, v0, v1, (int) m_screen_stack.size());
++    }
++  }
++#endif
++
++  if (m_screen_stack.empty())
++  {
++    return;  // nothing to deliver to yet (still starting up)
++  }
++
++  auto session = GameSession::current();
+   {
+     auto window_size = m_video_system.get_window_size();
+     auto window_width = window_size.width * 1.0f;
+@@ -526,7 +622,6 @@ ScreenManager::process_events()
+     }
+   }
+ }
+-
+ bool
+ ScreenManager::has_pending_fadeout() const
+ {
+@@ -715,11 +810,19 @@ static void g_loop_iter() {
+ #endif
+ 
+ void
+-ScreenManager::run()
++ScreenManager::begin()
+ {
+   Integration::init_all();
+ 
++  // push_screen() only queues an action, so the initial screen (the title screen) lands on
++  // the stack here rather than in launch_game().
+   handle_screen_switch();
++}
++
++void
++ScreenManager::run()
++{
++  begin();
+ #ifdef __EMSCRIPTEN__
+   emscripten_set_main_loop(g_loop_iter, -1, 1);
+ #else
+diff --git a/src/supertux/screen_manager.hpp b/src/supertux/screen_manager.hpp
+index 2d68fc6..ab41200 100644
+--- a/src/supertux/screen_manager.hpp
++++ b/src/supertux/screen_manager.hpp
+@@ -48,6 +48,10 @@ public:
+   ~ScreenManager() override;
+ 
+   void run();
++  /** Everything run() does before entering its loop: apply the screens that were queued
++      during start-up. Split out so the HarmonyOS entry point can drive the loop one frame
++      at a time (see src/ohos/main_ohos.cpp). */
++  void begin();
+   void quit(std::unique_ptr<ScreenFade> fade = {});
+   inline void set_speed(float speed) { m_speed = speed; }
+   inline float get_speed() const { return m_speed; }
+@@ -63,6 +67,17 @@ public:
+ 
+   void loop_iter();
+ 
++  /** Handle a single event. Used by the HarmonyOS entry point, which receives events through
++      SDL's main callbacks instead of polling the queue (see src/ohos/main_ohos.cpp). */
++  void process_event(SDL_Event event);
++
++#if defined(__OHOS__)
++  /** Queue an event that arrived through SDL's main callbacks. process_events() drains this
++      after InputManager::update(): update() flushes the controller state, so events processed
++      before it would have their control presses dropped before any menu or screen sees them. */
++  static void push_ohos_event(const SDL_Event& event);
++#endif
++
+   inline const std::vector<std::unique_ptr<Screen>>& get_screen_stack() { return m_screen_stack; }
+ 
+ private:
+diff --git a/src/util/file_system.cpp b/src/util/file_system.cpp
+index e2bf609..2f15389 100644
+--- a/src/util/file_system.cpp
++++ b/src/util/file_system.cpp
+@@ -38,7 +38,7 @@
+ #ifdef __EMSCRIPTEN__
+ #include <emscripten.h>
+ #include <emscripten/html5.h>
+-#else
++#elif defined(HAVE_CURL)
+ #include <curl/curl.h>
+ #endif
+ 
+diff --git a/src/util/log.cpp b/src/util/log.cpp
+index e76e70b..f02924a 100644
+--- a/src/util/log.cpp
++++ b/src/util/log.cpp
+@@ -20,6 +20,10 @@
+ #include <iostream>
+ #ifdef __ANDROID__
+ #include <android/log.h>
++#elif defined(__OHOS__)
++// HarmonyOS: route the log stream through SDL_Log(), which lands in hilog
++// (hdc hilog | grep -F supertux).
++#include <SDL3/SDL.h>
+ #endif
+ 
+ #include "math/rectf.hpp"
+@@ -27,9 +31,10 @@
+ #include "supertux/gameconfig.hpp"
+ #include "supertux/globals.hpp"
+ 
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(__OHOS__)
+ // To print only SuperTux logs in Android logcat output, use command:
+ // adb logcat -s 'SuperTux:V' 'SDL:V' 'DEBUG:V'
++// (On HarmonyOS the same stream goes to hilog via SDL_Log.)
+ class _android_debugbuf: public std::streambuf
+ {
+   public:
+@@ -87,7 +92,17 @@ class _android_debugbuf: public std::streambuf
+     if (pos >= sizeof(buf) - 1 || c == '\n' || c == '\r' || c == 0)
+     {
+       buf[pos] = 0;
++      // SDL_Log() appends its own newline, so drop the trailing one.
++      int len = pos;
++      while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
++      {
++        buf[--len] = 0;
++      }
++#if defined(__ANDROID__)
+       __android_log_print(ANDROID_LOG_INFO, "SuperTux", "%s", buf);
++#else
++      SDL_Log("[supertux] %s", buf);
++#endif
+       pos = 0;
+       buf[pos] = 0;
+     }
+@@ -105,7 +120,7 @@ std::ostream& get_logging_instance(bool use_console_buffer)
+   if (ConsoleBuffer::current() && use_console_buffer)
+     return (ConsoleBuffer::output);
+   else
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(__OHOS__)
+     return android_logcat;
+ #else
+     return (std::cerr);
+diff --git a/src/video/sdlbase_video_system.cpp b/src/video/sdlbase_video_system.cpp
+index 0dcbe9b..8f21a0c 100644
+--- a/src/video/sdlbase_video_system.cpp
++++ b/src/video/sdlbase_video_system.cpp
+@@ -118,7 +118,32 @@ SDLBaseVideoSystem::create_sdl_window(Uint32 flags)
+   SDL_SetHint(SDL_HINT_TOUCH_MOUSE_EVENTS, "0");
+   SDL_SetHint(SDL_HINT_MOUSE_TOUCH_EVENTS, "0");
+ 
++#ifdef __OHOS__
++  /* HarmonyOS: SDL gets the XComponent's native window from the XComponent callbacks, and the
++     surface is destroyed/recreated while we are still initializing (the system rebuilds it as
++     the window comes to the foreground), which clears SDL's stored pointers and makes
++     SDL_CreateWindow fail with "Don't have Native XComponent or Native Window". Wait for a
++     usable surface instead of giving up on the first attempt. */
++  for (int attempt = 0; (attempt < 150) && !m_sdl_window; attempt++)
++  {
++    m_sdl_window.reset(SDL_CreateWindow("SuperTux", size.width, size.height, flags));
++    if (!m_sdl_window)
++    {
++      if (attempt == 0)
++      {
++        SDL_Log("[supertux] SDL_CreateWindow failed (%s); waiting for the HarmonyOS surface", SDL_GetError());
++      }
++      SDL_ClearError();
++      SDL_Delay(100);
++    }
++  }
++  if (m_sdl_window)
++  {
++    SDL_Log("[supertux] SDL_CreateWindow succeeded");
++  }
++#else
+   m_sdl_window.reset(SDL_CreateWindow("SuperTux", size.width, size.height, flags));
++#endif
+   if (!m_sdl_window)
+   {
+     std::ostringstream msg;

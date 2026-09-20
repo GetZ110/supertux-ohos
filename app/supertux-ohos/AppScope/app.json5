@@ -1,0 +1,15 @@
+{
+  "app": {
+    // Must match the App ID / bundle name you created in AppGallery Connect, because the debug
+    // provisioning profile is issued per bundle name and the device checks them against each
+    // other. If you use a different name, change it here and pass -BundleName to
+    // scripts/build-supertux-hap.ps1.
+    "bundleName": "com.example.supertux2",
+    "vendor": "supertux",
+    "versionCode": 1000000,
+    "versionName": "0.7.0",
+    "buildVersion": "1",
+    "icon": "$media:layered_image",
+    "label": "$string:app_name"
+  }
+}

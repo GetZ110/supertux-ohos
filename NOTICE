@@ -1,0 +1,33 @@
+# Third-party components and trademarks
+
+This repository contains build glue, patches and documentation for running
+[SuperTux](https://github.com/SuperTux/supertux) on OpenHarmony / HarmonyOS. It does not
+contain third-party sources: `scripts/fetch-sources.ps1` clones them from their own
+repositories at the revisions listed in `scripts/versions.txt`.
+
+## Components
+
+| Component | License | How it is used here |
+|---|---|---|
+| SuperTux | GPL-3.0-or-later | The game being ported. `patches/supertux-ohos.patch` modifies its sources, so anything built from it is covered by the GPL. |
+| SDL3 | zlib | Platform layer. `patches/sdl-ohos.patch` contains local changes for this port. |
+| SDL3_image, SDL3_ttf | zlib | Image and font loading for SuperTux. |
+| PhysFS | zlib | Archive/filesystem layer used by SuperTux. |
+| libpng | libpng-2.0 | PNG decoding. |
+| FreeType | FTL / GPL-2.0 | Font rasterisation. |
+| fmt, glm | MIT | Formatting and math. |
+| libogg, libvorbis | BSD-3-Clause | Audio decoding. |
+| OpenAL Soft | LGPL-2.0-or-later | Audio output (built with the null/wave backends for now, so it is currently silent). |
+
+SuperTux's own data files (levels, images, music) are covered by its own licensing
+(mostly GPL-3.0-or-later and CC-BY-SA); they are fetched with the SuperTux sources and are
+not stored in this repository.
+
+## Trademarks
+
+HarmonyOS and OpenHarmony are trademarks of their respective owners (Huawei and the
+OpenAtom Foundation). This is an unofficial, community port: it is not affiliated with,
+sponsored by or endorsed by Huawei, the OpenAtom Foundation, or the SuperTux project. Any
+use of those names here is descriptive, to say what the port targets.
+
+SDL is a trademark of its author; SuperTux is the work of the SuperTux Development Team.

@@ -1,0 +1,19 @@
+# Pinned third-party revisions used by this port.
+#
+# Format:  <path under third_party/>|<git url>|<commit or tag>|<note>
+# scripts/fetch-sources.ps1 checks these out, then applies patches/*.patch on top.
+# Keeping them pinned is what makes a build here reproducible: SDL's HarmonyOS support
+# landed on main after the 3.4.x releases, so "whatever main is today" is not a build input.
+
+SDL|https://github.com/libsdl-org/SDL.git|a6c68172beb08143d895bc8d8980d0796903c4e4|main; contains src/video/openharmony (SDL 3.5.0 dev)
+SDL_image|https://github.com/libsdl-org/SDL_image.git|7821e4e093c10c2c6af0e73a37cdefe15ba40208|main
+SDL_ttf|https://github.com/libsdl-org/SDL_ttf.git|d07d10143ee1eec548f54e40e4e4cec2446cd640|main
+SuperTux|https://github.com/SuperTux/supertux.git|b9c527f27141e61878a631070d4dda96bf995e8c|needs --recursive submodules
+deps/libpng|https://github.com/pnggroup/libpng.git|964b4135949703b705fc760fc3fb546b86e5ab47|main
+deps/physfs|https://github.com/icculus/physfs.git|ccffd00e1202a4fbd655f7c84171eee6182d9a53|main
+deps/fmt|https://github.com/fmtlib/fmt.git|cfb57bfa3aa90573abfc39a160bb0248e14fd64f|main
+deps/glm|https://github.com/g-truc/glm.git|6f14f4792a0cde5d0cf2c910506724d61cb95834|main
+deps/freetype|https://github.com/freetype/freetype.git|a69e39ad9ed44818ca316683f6984d25b2a7492b|main
+deps/ogg|https://github.com/xiph/ogg.git|06a5e0262cdc28aa4ae6797627a783b5010440f0|main
+deps/vorbis|https://github.com/xiph/vorbis.git|1b75110b5a2754ba1931d82dd83cb822b266a21d|main
+deps/openal|https://github.com/kcat/openal-soft.git|d3875f333fb6abe2f39d82caca329414871ae53b|tag 1.23.1; master uses C++20 lexicographical_compare_three_way, which OHOS's libc++ lacks
