@@ -12,10 +12,46 @@ index d009551..89e06ac 100644
        VERSION "${SDL_SO_VERSION}"
        SOVERSION "${SDL_SO_VERSION_MAJOR}"
 diff --git a/src/core/openharmony/SDL_openharmony.c b/src/core/openharmony/SDL_openharmony.c
-index a8b6872..4d38e96 100644
+index a8b6872..fc37b94 100644
 --- a/src/core/openharmony/SDL_openharmony.c
 +++ b/src/core/openharmony/SDL_openharmony.c
-@@ -1011,6 +1011,13 @@ static napi_value SDL_JS_UIAbility_OnWindowStageCreate(napi_env env, napi_callba
+@@ -573,6 +573,12 @@ static napi_value SDL_JS_ChangeSysBarsResult(napi_env env, napi_callback_info in
+     return GetNapiUndefined(env);
+ }
+ 
++// AsyncCallback for the setWindowLayoutFullScreen() call made alongside the bar toggle.
++static napi_value SDL_JS_SetLayoutFullScreenResult(napi_env env, napi_callback_info info)
++{
++    return GetNapiUndefined(env);
++}
++
+ // this function is called from the main Javascript thread when it's convenient to fire it.
+ static void CallJSChangeSysBars(napi_env env, napi_value js_callback, void *context, void *userdata)
+ {
+@@ -593,8 +599,21 @@ static void CallJSChangeSysBars(napi_env env, napi_value js_callback, void *cont
+     }
+ 
+     napi_value window = GetNapiRefValue(env, window_ref);
++
++    // Order matters here, and getting it backwards is what makes the bars come back: applying
++    // setWindowLayoutFullScreen() re-shows the system bars (sceneboard logs
++    // "isEnable changed: true, immersive is false" right after it), so the layout call has to
++    // happen *first* and the bar-hiding call last.
++    //
++    // Also note setSystemBarEnable() has been deprecated since API 9 in favour of
++    // setWindowSystemBarEnable(); call the supported name.
++    const bool layout_fullscreen = !(status_bar && navigation_bar);
++    napi_value layout_args[] = { GetNapiBoolean(env, layout_fullscreen),
++                                 CreateNapiFunction(env, NULL, SDL_JS_SetLayoutFullScreenResult, NULL) };
++    CallNapiMethod(env, window, "setWindowLayoutFullScreen", SDL_arraysize(layout_args), layout_args);
++
+     napi_value args[] = { arr, CreateNapiFunction(env, NULL, SDL_JS_ChangeSysBarsResult, NULL) };
+-    CallNapiMethod(env, window, "setSystemBarEnable", SDL_arraysize(args), args);
++    CallNapiMethod(env, window, "setWindowSystemBarEnable", SDL_arraysize(args), args);
+ }
+ 
+ bool SDL_OpenHarmonyToggleSystemBars(bool status_bar, bool navigation_bar)
+@@ -1011,6 +1030,13 @@ static napi_value SDL_JS_UIAbility_OnWindowStageCreate(napi_env env, napi_callba
      napi_value args[] = { CreateNapiString(env, "pages/Index"), CreateNapiFunction(env, NULL, SDL_JS_LoadContentResult, NULL) };
      CallNapiMethod(env, windowStage, "loadContent", SDL_arraysize(args), args);
  
@@ -29,8 +65,57 @@ index a8b6872..4d38e96 100644
      return GetNapiUndefined(env);
  }
  
+diff --git a/src/video/openharmony/SDL_openharmonyevents.c b/src/video/openharmony/SDL_openharmonyevents.c
+index 311a516..8df7c15 100644
+--- a/src/video/openharmony/SDL_openharmonyevents.c
++++ b/src/video/openharmony/SDL_openharmonyevents.c
+@@ -375,6 +375,31 @@ static SDL_Scancode MapOHKeycodeToSDLScancode(const OH_NativeXComponent_KeyCode
+     return SDL_SCANCODE_UNKNOWN;
+ }
+ 
++/* Register the touch device up front, the way the Android backend does in
++   Android_InitTouch() (called from Android_VideoInit).
++
++   On OpenHarmony the only SDL_AddTouch() call is the one inside
++   SDL_OpenHarmonyDispatchTouchEvent(), i.e. it happens lazily on the *first* finger event. That
++   makes SDL_GetTouchDevices() report zero devices during start-up, which is exactly when apps
++   probe for touch support -- SuperTux does:
++
++       SDL_GetTouchDevices(&num_touch_devices);
++       g_config->mobile_controls = (num_touch_devices > 0);
++
++   so it concluded "no touchscreen" on a phone and never enabled its on-screen controls. Worse,
++   MobileController::process_finger_*_event() scales the finger position by m_screen_width/height,
++   which are only assigned from MobileController::draw() -- and that returns early when
++   mobile_controls is false. Every touch therefore became (0,0) and produced no usable input:
++   taps looked completely dead.
++
++   Registering eagerly means the device is already known at start-up, so the touchscreen is
++   detected and the position scaling has real dimensions. The lazy call in the dispatch path stays
++   as a fallback for the first event. */
++void OPENHARMONY_InitTouch(void)
++{
++    SDL_AddTouch((SDL_TouchID)1, SDL_TOUCH_DEVICE_DIRECT, "OpenHarmony Touch");
++}
++
+ void SDL_OpenHarmonyDispatchTouchEvent(void *component, void *window)
+ {
+     OH_NativeXComponent *xcomponent = (OH_NativeXComponent *) component;
+diff --git a/src/video/openharmony/SDL_openharmonyevents.h b/src/video/openharmony/SDL_openharmonyevents.h
+index ee0f9d1..cf357fe 100644
+--- a/src/video/openharmony/SDL_openharmonyevents.h
++++ b/src/video/openharmony/SDL_openharmonyevents.h
+@@ -29,5 +29,8 @@ extern void SDL_OpenHarmonyDispatchKeyEvent(void *component, void *window);
+ extern void SDL_OpenHarmonyDispatchUIInputEvent(void *component, void *event, int32_t type);
+ 
+ extern void OPENHARMONY_InitEvents(void);
++// Registers the touch device at start-up so touch support is detectable before the first finger
++// event (see the definition for why that matters on this platform).
++extern void OPENHARMONY_InitTouch(void);
+ extern void OPENHARMONY_PumpEvents(SDL_VideoDevice *_this);
+ extern void OPENHARMONY_QuitEvents(void);
 diff --git a/src/video/openharmony/SDL_openharmonyvideo.c b/src/video/openharmony/SDL_openharmonyvideo.c
-index 63ab3db..4708365 100644
+index 63ab3db..5dd75a7 100644
 --- a/src/video/openharmony/SDL_openharmonyvideo.c
 +++ b/src/video/openharmony/SDL_openharmonyvideo.c
 @@ -70,6 +70,7 @@ void SDL_OpenHarmonyGetNativeWindowPointers(void **xcomponent, void **window)
@@ -49,8 +134,25 @@ index 63ab3db..4708365 100644
      SDL_assert(native_xcomponent == NULL);  // right now we assume one surface, one window.
      native_xcomponent = (OH_NativeXComponent *) component;
      native_window = window;
+@@ -167,11 +169,12 @@ static bool OPENHARMONY_VideoInit(SDL_VideoDevice *_this)
+     // !!! FIXME: look at SDL_OnApplicationDidChangeStatusBarOrientation() and do something similar.
+ 
+ 
+-// !!! FIXME
+-#if 0
++    // Register the touch device now, so apps that probe for a touchscreen during start-up (via
++    // SDL_GetTouchDevices()) detect this phone as a touch device. The upstream FIXME left this
++    // disabled, which made touch input unusable: see OPENHARMONY_InitTouch() for the full story.
++    // OPENHARMONY_InitMouse() stays off -- mouse events already arrive through the XComponent
++    // callbacks and enabling it here was not needed for them to work.
+     OPENHARMONY_InitTouch();
+-    OPENHARMONY_InitMouse();
+-#endif
+     OPENHARMONY_InitClipboard(_this);
+ 
+     // We're done!
 diff --git a/src/video/openharmony/SDL_openharmonywindow.c b/src/video/openharmony/SDL_openharmonywindow.c
-index f462d9d..d616c93 100644
+index f462d9d..5d6fcbf 100644
 --- a/src/video/openharmony/SDL_openharmonywindow.c
 +++ b/src/video/openharmony/SDL_openharmonywindow.c
 @@ -59,6 +59,7 @@ bool OPENHARMONY_CreateWindow(SDL_VideoDevice *_this, SDL_Window *window, SDL_Pr
@@ -74,3 +176,24 @@ index f462d9d..d616c93 100644
  endfunction:
  
      // !!! FIXME: Android has locking here; maybe it isn't necessary for OpenHarmony? What happens if we're in a background thread?
+@@ -132,10 +139,16 @@ void OPENHARMONY_SetWindowTitle(SDL_VideoDevice *_this, SDL_Window *window)
+ SDL_FullscreenResult OPENHARMONY_SetWindowFullscreen(SDL_VideoDevice *_this, SDL_Window *window, SDL_VideoDisplay *display, SDL_FullscreenOp fullscreen)
+ {
+     if (window == OPENHARMONY_Window) {
+-        const bool show_bars = (fullscreen == SDL_FULLSCREEN_OP_LEAVE);
+-        if (!SDL_OpenHarmonyToggleSystemBars(show_bars, show_bars)) {
+-            return SDL_FULLSCREEN_FAILED;
+-        }
++        /* An app that runs windowed still calls SDL_SetWindowFullscreen(window, 0) while setting its
++           video mode up -- SuperTux does exactly this on every apply_config(). Treating that as
++           "leave fullscreen, therefore show the system bars" made the bars reappear a few
++           milliseconds after they had been hidden, so the game never got the display to itself.
++           Showing the bars here would also be wrong on its own terms: on this platform the window
++           always occupies the whole display, so nothing about leaving "fullscreen" needs the bars
++           back. Hide them for both enter and leave, and let an app that genuinely wants the bars
++           ask for them through SDL_ShowWindow()/the window layout APIs. */
++        (void) fullscreen;
++        SDL_OpenHarmonyToggleSystemBars(false, false);
+         // !!! FIXME: make sure this causes an XComponent resize event, that we can pick up later.
+         return SDL_FULLSCREEN_PENDING;
+     }

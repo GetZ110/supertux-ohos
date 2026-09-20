@@ -48,6 +48,26 @@ foreach ($tool in @($CMAKE, $NINJA, $TOOLCHAIN)) {
     if (-not (Test-Path $tool)) { throw "not found: $tool (pass -CLT <path to Huawei command line tools>)" }
 }
 
+# OpenAL's output backend on OHOS is SDL3's audio subsystem (SDL3 -> OHAudio), so OpenAL needs
+# SDL3's headers and libSDL3.so in the prefix at configure time. build-sdl-ohos.ps1 normally runs
+# after this script, so make sure the SDL3 core is there first (SDL3_image/SDL3_ttf need libpng and
+# freetype from this script, so the two steps cannot simply be swapped).
+function Get-OpenAlSdl3Args {
+    $hdr = Join-Path $Prefix 'include\SDL3\SDL.h'
+    $lib = Join-Path $Prefix 'lib\libSDL3.so'
+    if ((Test-Path $hdr) -and (Test-Path $lib)) {
+        return @('-DALSOFT_BACKEND_SDL3=ON','-DALSOFT_REQUIRE_SDL3=ON',
+                 "-DSDL3_INCLUDE_DIR=$Prefix/include", "-DSDL3_LIBRARY=$lib")
+    }
+    return @()
+}
+
+$openalArgs = @('-DLIBTYPE=SHARED','-DALSOFT_EXAMPLES=OFF','-DALSOFT_UTILS=OFF','-DALSOFT_TESTS=OFF',
+                '-DHAVE_GCC_DEFAULT_VISIBILITY=1',
+                '-DALSOFT_BACKEND_ALSA=OFF','-DALSOFT_BACKEND_PULSEAUDIO=OFF','-DALSOFT_BACKEND_OSS=OFF',
+                '-DALSOFT_BACKEND_SNDIO=OFF','-DALSOFT_BACKEND_JACK=OFF','-DALSOFT_BACKEND_PIPEWIRE=OFF',
+                '-DALSOFT_BACKEND_WAVE=ON','-DALSOFT_BACKEND_NULL=ON') + (Get-OpenAlSdl3Args)
+
 # name, extra cmake args. Sources live in third_party/deps/<name>.
 $deps = @(
     @{ name='libpng';   args=@('-DPNG_SHARED=ON','-DPNG_STATIC=OFF','-DPNG_TESTS=OFF','-DPNG_TOOLS=OFF','-DPNG_EXECUTABLES=OFF') },
@@ -57,16 +77,22 @@ $deps = @(
     @{ name='freetype'; args=@('-DFT_DISABLE_HARFBUZZ=ON','-DFT_DISABLE_BROTLI=ON','-DFT_DISABLE_BZIP2=ON','-DBUILD_SHARED_LIBS=ON') },
     @{ name='ogg';      args=@('-DBUILD_SHARED_LIBS=ON','-DBUILD_TESTING=OFF') },
     @{ name='vorbis';   args=@('-DBUILD_SHARED_LIBS=ON','-DBUILD_TESTING=OFF') },
-    @{ name='openal';   args=@('-DLIBTYPE=SHARED','-DALSOFT_EXAMPLES=OFF','-DALSOFT_UTILS=OFF','-DALSOFT_TESTS=OFF',
-                               '-DHAVE_GCC_DEFAULT_VISIBILITY=1',
-                               '-DALSOFT_BACKEND_ALSA=OFF','-DALSOFT_BACKEND_PULSEAUDIO=OFF','-DALSOFT_BACKEND_OSS=OFF',
-                               '-DALSOFT_BACKEND_SNDIO=OFF','-DALSOFT_BACKEND_JACK=OFF','-DALSOFT_BACKEND_PIPEWIRE=OFF',
-                               '-DALSOFT_BACKEND_WAVE=ON','-DALSOFT_BACKEND_NULL=ON') }
+    @{ name='openal';   args=$openalArgs }
 )
 
 if ($ListOnly) { $deps | ForEach-Object { Write-Host $_.name }; return }
 
 New-Item -ItemType Directory -Force -Path $Prefix | Out-Null
+
+# Build the SDL3 core first when OpenAL is being built and SDL3 is not in the prefix yet.
+$wantOpenal = (-not $Only) -or ($Only -contains 'openal')
+if ($wantOpenal -and -not (Test-Path (Join-Path $Prefix 'include\SDL3\SDL.h'))) {
+    Write-Host "`n================ SDL3 (prerequisite of OpenAL) ================" -ForegroundColor Cyan
+    & (Join-Path $PSScriptRoot 'build-sdl-ohos.ps1') -SkipImage -SkipTtf -Prefix $Prefix
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host 'WARNING: SDL3 prerequisite build failed; OpenAL will have no output backend' -ForegroundColor Yellow
+    }
+}
 
 $results = @()
 foreach ($d in $deps) {

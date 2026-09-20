@@ -1,5 +1,5 @@
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index 93ffb84..4b1d50c 100644
+index 93ffb84e2..4b1d50c8c 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -117,14 +117,14 @@ endif()
@@ -46,24 +46,185 @@ index 93ffb84..4b1d50c 100644
  set_target_properties(supertux2 PROPERTIES COMPILE_FLAGS "${SUPERTUX2_EXTRA_WARNING_FLAGS}")
  
  # FIXME: As of writing, Emscripten fails with "wasm-ld: error: /path/to/emsdk/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten/thinlto/libc.a(fileno.o): attempt to add bitcode file after LTO (fileno)"
+diff --git a/src/ohos/main_ohos.cpp b/src/ohos/main_ohos.cpp
+new file mode 100644
+index 000000000..c795cacc9
+--- /dev/null
++++ b/src/ohos/main_ohos.cpp
+@@ -0,0 +1,123 @@
++//  SuperTux
++//  Copyright (C) 2026 SuperTux on HarmonyOS port contributors
++//
++//  This program is free software: you can redistribute it and/or modify
++//  it under the terms of the GNU General Public License as published by
++//  the Free Software Foundation, either version 3 of the License, or
++//  (at your option) any later version.
++//
++//  This program is distributed in the hope that it will be useful,
++//  but WITHOUT ANY WARRANTY; without even the implied warranty of
++//  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++//  GNU General Public License for more details.
++//
++//  You should have received a copy of the GNU General Public License
++//  along with this program.  If not, see <http://www.gnu.org/licenses/>.
++
++/* HarmonyOS / OpenHarmony entry point.
++ *
++ * SDL3 on this platform cannot use an ANSI main(): SDL takes over the app through ArkTS +
++ * XComponent and then dlopen()s libmain.so and looks up SDL_AppInit / SDL_AppIterate /
++ * SDL_AppEvent / SDL_AppQuit in it (see SDL's src/main/openharmony/SDL_sysmain_runapp.c).
++ * Those four callbacks live here; they drive Main::ohos_init / ohos_iterate / ohos_shutdown,
++ * which is the blocking Main::run() loop split into one-frame pieces.
++ *
++ * SDL_MAIN_USE_CALLBACKS must be defined before any SDL header is included: SDL_main_impl.h
++ * #errors on OpenHarmony without it, and this translation unit deliberately provides no main().
++ */
++
++#define SDL_MAIN_USE_CALLBACKS 1
++
++#include <memory>
++
++#include <SDL3/SDL.h>
++#include <SDL3/SDL_main.h>
++
++#include "supertux/main.hpp"
++#include "supertux/screen_manager.hpp"
++
++namespace {
++/* Same ownership model as src/main.cpp: one Main for the process, created in SDL_AppInit and
++   destroyed in SDL_AppQuit. Manually reset rather than relying on atexit(), for the reason
++   given in src/main.cpp -- atexit handlers run before global destructors and would crash. */
++std::unique_ptr<Main> g_main;
++} // namespace
++
++extern "C" {
++
++SDL_AppResult SDLCALL
++SDL_AppInit(void** appstate, int argc, char* argv[])
++{
++  (void) appstate;
++
++  SDL_Log("[supertux] SDL_AppInit: argc=%d", argc);
++
++  g_main = std::make_unique<Main>();
++  if (!g_main->ohos_init(argc, argv))
++  {
++    SDL_LogError(SDL_LOG_CATEGORY_APPLICATION, "[supertux] SDL_AppInit: ohos_init() failed");
++    g_main.reset();
++    return SDL_APP_FAILURE;
++  }
++
++  SDL_Log("[supertux] SDL_AppInit: ok, entering the frame loop");
++  return SDL_APP_CONTINUE;
++}
++
++SDL_AppResult SDLCALL
++SDL_AppIterate(void* appstate)
++{
++  (void) appstate;
++
++  if (!g_main)
++  {
++    return SDL_APP_FAILURE;
++  }
++
++  // ohos_iterate() runs one ScreenManager::loop_iter() and reports whether any screen is
++  // still on the stack; an empty stack is the normal way SuperTux quits.
++  if (!g_main->ohos_iterate())
++  {
++    SDL_Log("[supertux] SDL_AppIterate: screen stack empty, quitting");
++    return SDL_APP_SUCCESS;
++  }
++
++  return SDL_APP_CONTINUE;
++}
++
++SDL_AppResult SDLCALL
++SDL_AppEvent(void* appstate, SDL_Event* event)
++{
++  (void) appstate;
++
++  if (event)
++  {
++    // Hand the event to the game instead of leaving it in SDL's queue. SDL's main-callback
++    // dispatch drains that queue before SDL_AppIterate runs, and ScreenManager::loop_iter()
++    // can return early (its "not enough time for a game step yet" path) without polling at
++    // all -- so a queue-based bridge would both delay events and deliver them several times.
++    // ScreenManager::process_events() drains this hand-off queue right after
++    // InputManager::update(), because update() flushes the controller state and a control
++    // press processed before it would never reach a menu or screen.
++    ScreenManager::push_ohos_event(*event);
++  }
++
++  return SDL_APP_CONTINUE;
++}
++
++void SDLCALL
++SDL_AppQuit(void* appstate, SDL_AppResult result)
++{
++  (void) appstate;
++  (void) result;
++
++  SDL_Log("[supertux] SDL_AppQuit: result=%d", (int) result);
++
++  if (g_main)
++  {
++    g_main->ohos_shutdown();
++    g_main.reset();
++  }
++}
++
++} // extern "C"
 diff --git a/src/supertux/gameconfig.cpp b/src/supertux/gameconfig.cpp
-index 9d88e52..4795008 100644
+index 9d88e52fb..e5eb8d21e 100644
 --- a/src/supertux/gameconfig.cpp
 +++ b/src/supertux/gameconfig.cpp
-@@ -54,6 +54,11 @@ Config::Config() :
+@@ -54,6 +54,16 @@ Config::Config() :
  #ifdef __ANDROID__
    use_fullscreen(true),
  #else
-+  // NOTE: HarmonyOS deliberately stays "windowed" here. SDL's OpenHarmony fullscreen path
-+  // (OPENHARMONY_SetWindowFullscreen -> setSystemBarEnable) hides the status/navigation bars but
-+  // has a FIXME about not resizing the XComponent afterwards, which leaves the frame buffer
-+  // rotated/squeezed. The ArkTS shell hides the bars instead (see supertux-ohos EntryAbility.ets)
-+  // and lets the window fill the display, so SDL never has to switch modes.
++  // NOTE: HarmonyOS deliberately stays "windowed" here, and that is now fine:
++  //   * SDL lays the window out over the whole display and keeps the system bars hidden
++  //     (SDL_openharmonywindow.c), including for the SDL_SetWindowFullscreen(window, 0) that
++  //     apply_video_mode() performs below -- that call used to re-show the bars and was what kept
++  //     the game out of the top and bottom of the screen;
++  //   * the viewport is built from the window SDL actually got rather than this config value
++  //     (sdl_video_system.cpp), so the game fills whatever surface the system hands us.
++  // Staying windowed also keeps Viewport's pixel aspect ratio at 1.0, which enabling fullscreen
++  // here would not: it would then derive the ratio from fullscreen_size vs the desktop size and
++  // distort the picture whenever those differ.
    use_fullscreen(false),
  #endif
    video(VideoSystem::VIDEO_SDL),
+@@ -91,7 +101,11 @@ Config::Config() :
+   transitions_enabled(true),
+   confirmation_dialog(false),
+   pause_on_focusloss(true),
+-#ifdef __ANDROID__
++#if defined(__ANDROID__) || defined(__OHOS__)
++  // No software mouse cursor on touch-only platforms. HarmonyOS fell into the desktop #else branch
++  // and so drew SuperTux's own cursor sprite; that was invisible while touch was broken (the sprite
++  // only appears at a position set by an event), but as soon as touch input worked it started
++  // following the finger around and getting in the way.
+   custom_mouse_cursor(false),
+ #else
+   custom_mouse_cursor(true),
+@@ -182,6 +196,13 @@ Config::load()
+   config_mapping.get("custom_mouse_cursor", custom_mouse_cursor);
+   config_mapping.get("custom_system_cursor", custom_system_cursor);
+   config_mapping.get("do_release_check", do_release_check);
++#ifdef __OHOS__
++  // Force the software cursor off instead of only defaulting it off above: the setting is
++  // persisted to "config", so an install that already saved custom_mouse_cursor=true from an
++  // earlier build would load that value back and keep drawing a cursor over the game. A phone has
++  // no pointer, and Android disables this the same way; the on-screen touch controls replace it.
++  custom_mouse_cursor = false;
++#endif
+ #ifdef NETWORKING // don't bother parsing this otherwise, since it's true by default.
+   config_mapping.get("disable_network", disable_network);
+ #endif
 diff --git a/src/supertux/main.cpp b/src/supertux/main.cpp
-index 6dfd1f4..7418e73 100644
+index 6dfd1f468..7418e73d7 100644
 --- a/src/supertux/main.cpp
 +++ b/src/supertux/main.cpp
 @@ -222,6 +222,34 @@ void PhysfsSubsystem::find_mount_datadir()
@@ -366,7 +527,7 @@ index 6dfd1f4..7418e73 100644
 +}
 +#endif
 diff --git a/src/supertux/main.hpp b/src/supertux/main.hpp
-index 9fde8ae..3f23707 100644
+index 9fde8ae99..3f237071a 100644
 --- a/src/supertux/main.hpp
 +++ b/src/supertux/main.hpp
 @@ -93,7 +93,21 @@ public:
@@ -392,7 +553,7 @@ index 9fde8ae..3f23707 100644
    void init_video();
  
 diff --git a/src/supertux/screen_manager.cpp b/src/supertux/screen_manager.cpp
-index 6dfb1a1..366e6a2 100644
+index 6dfb1a131..366e6a24f 100644
 --- a/src/supertux/screen_manager.cpp
 +++ b/src/supertux/screen_manager.cpp
 @@ -338,13 +338,109 @@ ScreenManager::update_gamelogic(float dt_sec)
@@ -536,7 +697,7 @@ index 6dfb1a1..366e6a2 100644
    emscripten_set_main_loop(g_loop_iter, -1, 1);
  #else
 diff --git a/src/supertux/screen_manager.hpp b/src/supertux/screen_manager.hpp
-index 2d68fc6..ab41200 100644
+index 2d68fc6a3..ab4120021 100644
 --- a/src/supertux/screen_manager.hpp
 +++ b/src/supertux/screen_manager.hpp
 @@ -48,6 +48,10 @@ public:
@@ -569,7 +730,7 @@ index 2d68fc6..ab41200 100644
  
  private:
 diff --git a/src/util/file_system.cpp b/src/util/file_system.cpp
-index e2bf609..2f15389 100644
+index e2bf6093e..2f15389bd 100644
 --- a/src/util/file_system.cpp
 +++ b/src/util/file_system.cpp
 @@ -38,7 +38,7 @@
@@ -582,7 +743,7 @@ index e2bf609..2f15389 100644
  #endif
  
 diff --git a/src/util/log.cpp b/src/util/log.cpp
-index e76e70b..f02924a 100644
+index e76e70b42..f02924ac9 100644
 --- a/src/util/log.cpp
 +++ b/src/util/log.cpp
 @@ -20,6 +20,10 @@
@@ -635,8 +796,36 @@ index e76e70b..f02924a 100644
      return android_logcat;
  #else
      return (std::cerr);
+diff --git a/src/video/sdl/sdl_video_system.cpp b/src/video/sdl/sdl_video_system.cpp
+index 5cc221dca..9128dd331 100644
+--- a/src/video/sdl/sdl_video_system.cpp
++++ b/src/video/sdl/sdl_video_system.cpp
+@@ -85,12 +85,20 @@ SDLVideoSystem::apply_config()
+   apply_video_mode();
+ 
+   { // apply_viewport
+-#ifndef __ANDROID__
++#if defined(__OHOS__)
++    /* HarmonyOS hands the app a window whose size is decided by the system: SDL sets it from the
++       XComponent in OPENHARMONY_CreateWindow(), and there is no SetWindowSize backend to change
++       it afterwards (SDL_SetWindowSize just fails with "not supported"). Building the viewport
++       from g_config->window_size -- 1280x800 by default -- therefore draws the whole game into a
++       1280x800 corner of a 2720x1046 surface. Use the window we actually got; SuperTux's own
++       auto-scaling in Viewport::from_size() then fills the display. */
++    Size target_size = get_window_size();
++#elif defined(__ANDROID__)
++    Size target_size = m_desktop_size;
++#else
+     Size target_size = (g_config->use_fullscreen && g_config->fullscreen_size != Size(0, 0)) ?
+       g_config->fullscreen_size :
+       g_config->window_size;
+-#else
+-    Size target_size = m_desktop_size;
+ #endif
+     m_viewport = Viewport::from_size(target_size, m_desktop_size);
+   }
 diff --git a/src/video/sdlbase_video_system.cpp b/src/video/sdlbase_video_system.cpp
-index 0dcbe9b..8f21a0c 100644
+index 0dcbe9bc7..8f21a0c08 100644
 --- a/src/video/sdlbase_video_system.cpp
 +++ b/src/video/sdlbase_video_system.cpp
 @@ -118,7 +118,32 @@ SDLBaseVideoSystem::create_sdl_window(Uint32 flags)

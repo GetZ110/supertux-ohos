@@ -90,8 +90,9 @@ if ($SkipPatches) {
 
 Write-Host "`n=== applying patches ===" -ForegroundColor Cyan
 $patches = @(
-    @{ Target = 'SDL';      Patch = 'sdl-ohos.patch' },
-    @{ Target = 'SuperTux'; Patch = 'supertux-ohos.patch' }
+    @{ Target = 'SDL';          Patch = 'sdl-ohos.patch' },
+    @{ Target = 'SuperTux';     Patch = 'supertux-ohos.patch' },
+    @{ Target = 'deps/openal';  Patch = 'openal-ohos-sdl3.patch' }
 )
 foreach ($p in $patches) {
     $target = Join-Path $ThirdParty $p.Target

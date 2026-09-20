@@ -1,0 +1,402 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 55644b0..88cfb64 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -1184,6 +1184,27 @@ if(ALSOFT_REQUIRE_SDL2 AND NOT SDL2_FOUND)
+     message(FATAL_ERROR "Failed to enabled required SDL2 backend")
+ endif()
+ 
++# Check for SDL3 backend
++# Off by default, since it adds a runtime dependency.
++# SDL3 is not looked up with find_package() here: this build usually
++# cross-compiles, so the caller passes SDL3_INCLUDE_DIR/SDL3_LIBRARY explicitly.
++option(ALSOFT_BACKEND_SDL3 "Enable SDL3 backend" OFF)
++option(ALSOFT_REQUIRE_SDL3 "Require SDL3 backend" OFF)
++if(ALSOFT_BACKEND_SDL3)
++    if(SDL3_INCLUDE_DIR AND SDL3_LIBRARY)
++        set(HAVE_SDL3 1)
++        set(ALC_OBJS  ${ALC_OBJS} alc/backends/sdl3.cpp alc/backends/sdl3.h)
++        set(BACKENDS  "${BACKENDS} SDL3,")
++        set(INC_PATHS ${INC_PATHS} ${SDL3_INCLUDE_DIR})
++        set(EXTRA_LIBS ${EXTRA_LIBS} ${SDL3_LIBRARY})
++    else()
++        message(STATUS "Could NOT find SDL3 (set SDL3_INCLUDE_DIR and SDL3_LIBRARY)")
++    endif()
++endif()
++if(ALSOFT_REQUIRE_SDL3 AND NOT HAVE_SDL3)
++    message(FATAL_ERROR "Failed to enabled required SDL3 backend")
++endif()
++
+ # Optionally enable the Wave Writer backend
+ option(ALSOFT_BACKEND_WAVE "Enable Wave Writer backend" ON)
+ if(ALSOFT_BACKEND_WAVE)
+diff --git a/alc/alc.cpp b/alc/alc.cpp
+index af8ff55..8cd6bc4 100644
+--- a/alc/alc.cpp
++++ b/alc/alc.cpp
+@@ -151,6 +151,9 @@
+ #ifdef HAVE_SDL2
+ #include "backends/sdl2.h"
+ #endif
++#ifdef HAVE_SDL3
++#include "backends/sdl3.h"
++#endif
+ #ifdef HAVE_WAVE
+ #include "backends/wave.h"
+ #endif
+@@ -250,6 +253,9 @@ BackendInfo BackendList[] = {
+ #ifdef HAVE_SDL2
+     { "sdl2", SDL2BackendFactory::getFactory },
+ #endif
++#ifdef HAVE_SDL3
++    { "sdl3", SDL3BackendFactory::getFactory },
++#endif
+ 
+     { "null", NullBackendFactory::getFactory },
+ #ifdef HAVE_WAVE
+diff --git a/alc/backends/sdl3.cpp b/alc/backends/sdl3.cpp
+new file mode 100644
+index 0000000..38978d9
+--- /dev/null
++++ b/alc/backends/sdl3.cpp
+@@ -0,0 +1,301 @@
++/**
++ * OpenAL cross platform audio library
++ * Copyright (C) 2018 by authors.
++ * This library is free software; you can redistribute it and/or
++ *  modify it under the terms of the GNU Library General Public
++ *  License as published by the Free Software Foundation; either
++ *  version 2 of the License, or (at your option) any later version.
++ *
++ * This library is distributed in the hope that it will be useful,
++ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
++ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ *  Library General Public License for more details.
++ *
++ * You should have received a copy of the GNU Library General Public
++ *  License along with this library; if not, write to the
++ *  Free Software Foundation, Inc.,
++ *  51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA.
++ * Or go to http://www.gnu.org/copyleft/lgpl.html
++ */
++
++#include "config.h"
++
++#include "sdl3.h"
++
++#include <cassert>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++#include "almalloc.h"
++#include "alnumeric.h"
++#include "core/device.h"
++#include "core/logging.h"
++
++_Pragma("GCC diagnostic push")
++_Pragma("GCC diagnostic ignored \"-Wold-style-cast\"")
++#include <SDL3/SDL.h>
++_Pragma("GCC diagnostic pop")
++
++
++namespace {
++
++#ifdef _WIN32
++#define DEVNAME_PREFIX "OpenAL Soft on "
++#else
++#define DEVNAME_PREFIX ""
++#endif
++
++constexpr char defaultDeviceName[] = DEVNAME_PREFIX "Default Device";
++
++/* SDL3 dropped the SDL2 "open a device with a callback" API in favour of
++ * SDL_AudioStream. SDL_OpenAudioDeviceStream() returns a stream already bound
++ * to a device, opened in the *paused* state, and its callback is the stream's
++ * "get" callback: it runs whenever the device needs more data, and the app is
++ * expected to hand more data over with SDL_PutAudioStreamData(). Unlike SDL2
++ * there is no SDL_AUDIO_ALLOW_ANY_CHANGE; the stream always converts between
++ * the app-side format (the spec we pass in) and whatever the device natively
++ * wants, so we render in the app-side format reported back by
++ * SDL_GetAudioStreamFormat(). The callback may run on any thread, but the
++ * stream lock is held while it runs, so the mixer it calls into is serialised.
++ */
++struct Sdl3Backend final : public BackendBase {
++    Sdl3Backend(DeviceBase *device) noexcept : BackendBase{device} { }
++    ~Sdl3Backend() override;
++
++    void audioCallback(SDL_AudioStream *stream, int len) noexcept;
++    static void audioCallbackC(void *ptr, SDL_AudioStream *stream, int len, int) noexcept
++    { static_cast<Sdl3Backend*>(ptr)->audioCallback(stream, len); }
++
++    static SDL_AudioDeviceID devidFromName(const char *name);
++
++    void open(const char *name) override;
++    bool reset() override;
++    void start() override;
++    void stop() override;
++
++    SDL_AudioStream *mStream{nullptr};
++    uint mFrameSize{0};
++
++    uint mFrequency{0u};
++    DevFmtChannels mFmtChans{};
++    DevFmtType     mFmtType{};
++    uint mUpdateSize{0u};
++
++    DEF_NEWDEL(Sdl3Backend)
++};
++
++Sdl3Backend::~Sdl3Backend()
++{
++    /* Destroying the stream also closes the device SDL_OpenAudioDeviceStream()
++     * opened for it. */
++    if(mStream)
++        SDL_DestroyAudioStream(mStream);
++    mStream = nullptr;
++}
++
++void Sdl3Backend::audioCallback(SDL_AudioStream *stream, int len) noexcept
++{
++    if(!mFrameSize || len <= 0)
++        return;
++
++    /* The request is usually frame-aligned, but it is only documented as
++     * "slightly overestimated", so round down and let SDL ask again for the
++     * remainder rather than emitting a partial frame. */
++    const auto samples = static_cast<uint>(len) / mFrameSize;
++    if(!samples)
++        return;
++
++    std::vector<al::byte> buffer(static_cast<size_t>(samples) * mFrameSize);
++    mDevice->renderSamples(buffer.data(), samples, mDevice->channelsFromFmt());
++    SDL_PutAudioStreamData(stream, buffer.data(), static_cast<int>(buffer.size()));
++}
++
++SDL_AudioDeviceID Sdl3Backend::devidFromName(const char *name)
++{
++    if(!name || strcmp(name, defaultDeviceName) == 0)
++        return SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
++
++    const size_t prefix_len = strlen(DEVNAME_PREFIX);
++    const char *devname = name;
++    if(prefix_len > 0 && strncmp(devname, DEVNAME_PREFIX, prefix_len) == 0)
++        devname += prefix_len;
++
++    int num_devices{0};
++    SDL_AudioDeviceID *devids{SDL_GetAudioPlaybackDevices(&num_devices)};
++    if(devids)
++    {
++        SDL_AudioDeviceID match{0};
++        for(int i{0};i < num_devices && !match;++i)
++        {
++            const char *cand{SDL_GetAudioDeviceName(devids[i])};
++            if(cand && strcmp(cand, devname) == 0)
++                match = devids[i];
++        }
++        SDL_free(devids);
++        if(match)
++            return match;
++    }
++    /* Fall back to the default rather than failing to open: a stale name from
++     * the config file should not silence the game. */
++    return SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK;
++}
++
++void Sdl3Backend::open(const char *name)
++{
++    SDL_AudioSpec want{};
++    SDL_zero(want);
++
++    want.freq = static_cast<int>(mDevice->Frequency);
++    switch(mDevice->FmtType)
++    {
++    case DevFmtUByte: want.format = SDL_AUDIO_U8; break;
++    case DevFmtByte: want.format = SDL_AUDIO_S8; break;
++    /* SDL3 has no unsigned 16-bit format; the closest it can do is signed 16-bit. */
++    case DevFmtUShort: want.format = SDL_AUDIO_S16; break;
++    case DevFmtShort: want.format = SDL_AUDIO_S16; break;
++    case DevFmtUInt: /* fall-through */
++    case DevFmtInt: want.format = SDL_AUDIO_S32; break;
++    case DevFmtFloat: want.format = SDL_AUDIO_F32; break;
++    }
++    want.channels = (mDevice->FmtChans == DevFmtMono) ? 1 : 2;
++
++    SDL_AudioDeviceID devid{devidFromName(name)};
++
++    SDL_AudioStream *stream{SDL_OpenAudioDeviceStream(devid, &want,
++        &Sdl3Backend::audioCallbackC, this)};
++    if(!stream)
++        throw al::backend_exception{al::backend_error::NoDevice, "%s", SDL_GetError()};
++
++    /* The app side of the stream is what our callback has to produce. */
++    SDL_AudioSpec got{};
++    SDL_zero(got);
++    if(!SDL_GetAudioStreamFormat(stream, &got, nullptr))
++    {
++        SDL_DestroyAudioStream(stream);
++        throw al::backend_exception{al::backend_error::DeviceError,
++            "Failed to query SDL audio stream format: %s", SDL_GetError()};
++    }
++    if(got.channels < 1 || got.freq < 1)
++    {
++        SDL_DestroyAudioStream(stream);
++        throw al::backend_exception{al::backend_error::DeviceError,
++            "Unhandled SDL channel count: %d", int{got.channels}};
++    }
++
++    DevFmtChannels devchans{};
++    if(got.channels >= 2)
++        devchans = DevFmtStereo;
++    else
++        devchans = DevFmtMono;
++
++    DevFmtType devtype{};
++    switch(got.format)
++    {
++    case SDL_AUDIO_U8:  devtype = DevFmtUByte;  break;
++    case SDL_AUDIO_S8:  devtype = DevFmtByte;   break;
++    case SDL_AUDIO_S16: devtype = DevFmtShort;  break;
++    case SDL_AUDIO_S32: devtype = DevFmtInt;    break;
++    case SDL_AUDIO_F32: devtype = DevFmtFloat;  break;
++    default:
++        SDL_DestroyAudioStream(stream);
++        throw al::backend_exception{al::backend_error::DeviceError, "Unhandled SDL format: 0x%04x",
++            got.format};
++    }
++
++    if(mStream)
++        SDL_DestroyAudioStream(mStream);
++    mStream = stream;
++
++    mFrequency = static_cast<uint>(got.freq);
++    mFmtChans = devchans;
++    mFmtType = devtype;
++    /* Bytes per sample frame in the format our callback is asked to produce. Without this the
++     * callback cannot convert SDL's byte count into a sample count. */
++    mFrameSize = BytesFromDevFmt(devtype) * static_cast<uint>(got.channels);
++    /* SDL3's SDL_AudioSpec has no "samples" field, so the period stays whatever OpenAL chose. */
++    mUpdateSize = mDevice->UpdateSize;
++
++    mDevice->DeviceName = name ? name : defaultDeviceName;
++
++    TRACE("SDL3 channel count: %d, format: 0x%04x, frequency: %u", int{got.channels},
++        got.format, mFrequency);
++    TRACE("SDL3 device name: \"%s\"", mDevice->DeviceName.c_str());
++}
++
++bool Sdl3Backend::reset()
++{
++    mDevice->Frequency = mFrequency;
++    mDevice->FmtChans = mFmtChans;
++    mDevice->FmtType = mFmtType;
++    mDevice->UpdateSize = mUpdateSize;
++    mDevice->BufferSize = mUpdateSize * 2;
++    setDefaultWFXChannelOrder();
++    return true;
++}
++
++void Sdl3Backend::start()
++{
++    if(mStream)
++        SDL_ResumeAudioStreamDevice(mStream);
++}
++
++void Sdl3Backend::stop()
++{
++    if(mStream)
++        SDL_PauseAudioStreamDevice(mStream);
++}
++
++} // namespace
++
++BackendFactory &SDL3BackendFactory::getFactory()
++{
++    static SDL3BackendFactory factory{};
++    return factory;
++}
++
++bool SDL3BackendFactory::init()
++{
++    if(!SDL_WasInit(SDL_INIT_AUDIO) && !SDL_InitSubSystem(SDL_INIT_AUDIO))
++        return false;
++    return true;
++}
++
++bool SDL3BackendFactory::querySupport(BackendType type)
++{ return type == BackendType::Playback; }
++
++std::string SDL3BackendFactory::probe(BackendType type)
++{
++    std::string outnames;
++
++    if(type != BackendType::Playback)
++        return outnames;
++
++    /* Includes null char. */
++    outnames.append(defaultDeviceName, sizeof(defaultDeviceName));
++
++    int num_devices{0};
++    SDL_AudioDeviceID *devids{SDL_GetAudioPlaybackDevices(&num_devices)};
++    if(devids)
++    {
++        for(int i{0};i < num_devices;++i)
++        {
++            const char *name{SDL_GetAudioDeviceName(devids[i])};
++            if(!name || !*name)
++                continue;
++            std::string devname{DEVNAME_PREFIX};
++            devname += name;
++            outnames.append(devname.c_str(), devname.length()+1);
++        }
++        SDL_free(devids);
++    }
++    return outnames;
++}
++
++BackendPtr SDL3BackendFactory::createBackend(DeviceBase *device, BackendType type)
++{
++    if(type == BackendType::Playback)
++        return BackendPtr{new Sdl3Backend{device}};
++    return nullptr;
++}
+diff --git a/alc/backends/sdl3.h b/alc/backends/sdl3.h
+new file mode 100644
+index 0000000..2c5a060
+--- /dev/null
++++ b/alc/backends/sdl3.h
+@@ -0,0 +1,19 @@
++#ifndef BACKENDS_SDL3_H
++#define BACKENDS_SDL3_H
++
++#include "base.h"
++
++struct SDL3BackendFactory final : public BackendFactory {
++public:
++    bool init() override;
++
++    bool querySupport(BackendType type) override;
++
++    std::string probe(BackendType type) override;
++
++    BackendPtr createBackend(DeviceBase *device, BackendType type) override;
++
++    static BackendFactory &getFactory();
++};
++
++#endif /* BACKENDS_SDL3_H */
+diff --git a/config.h.in b/config.h.in
+index 477d8c7..bf2906c 100644
+--- a/config.h.in
++++ b/config.h.in
+@@ -76,6 +76,9 @@
+ /* Define if we have the SDL2 backend */
+ #cmakedefine HAVE_SDL2
+ 
++/* Define if we have the SDL3 backend */
++#cmakedefine HAVE_SDL3
++
+ /* Define if we have dlfcn.h */
+ #cmakedefine HAVE_DLFCN_H
+ 
