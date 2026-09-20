@@ -36,47 +36,39 @@ export default class EntryAbility extends UIAbility {
     }
 
     this.startSDL();
-    // NOTE: deliberately no window/system-bar calls here. SDL hides the status and navigation
-    // bars itself, at the point Huawei documents for it (its onWindowStageCreate hook, via
-    // setSystemBarEnable). Calling setWindowLayoutFullScreen()/setImmersiveModeEnabledState()
-    // from here on a timer appeared to reset that state: sceneboard logged the bars being hidden
-    // and then re-enabled ~2.6s later.
+    this.goFullscreen();
   }
 
   //  Hide the system status bar and the navigation bar, and let our layout cover the whole
-  //  display, so the game has no white bands above and below it.
+  //  display, so the game has no black bands above and below it.
   //
-  //  This is done here rather than by asking SDL for a fullscreen window: SDL's OpenHarmony
-  //  fullscreen path calls setSystemBarEnable() but (per its own FIXME) does not get an
-  //  XComponent resize afterwards, which leaves the frame buffer rotated/squeezed. Keeping the
-  //  SDL window as-is and only changing the window layout keeps the surface geometry sane.
+  //  Order matters and is the whole trick here: setWindowLayoutFullScreen() re-shows the bars when
+  //  it is applied (sceneboard logs "isEnable changed: true" right after it), so the bar-hiding
+  //  call has to come *last* or it is undone ~25ms later. Measured on Mate 60 Pro / HarmonyOS
+  //  7.0.0.107.
   private goFullscreen(): void {
-    // The window stage does not exist yet in onCreate(), and SDL takes over the ability's
-    // onWindowStageCreate() hook, so reach for the window a little later instead. Re-apply once
-    // more afterwards: the system can put the status bar back when the window first gets focus.
-    setTimeout(() => { this.hideSystemBars(); }, 300);
-    setTimeout(() => { this.hideSystemBars(); }, 1500);
+    // The window does not exist yet in onCreate(), and SDL takes over the ability's
+    // onWindowStageCreate() hook, so reach for the window a little later instead.
+    setTimeout(() => { this.applyImmersive(); }, 300);
+    setTimeout(() => { this.applyImmersive(); }, 1500);
   }
 
-  private hideSystemBars(): void {
+  private applyImmersive(): void {
     window.getLastWindow(this.context).then((win: window.Window) => {
-      // Only immersive mode + full-screen layout here. Calling setWindowSystemBarEnable([]) /
-      // setSpecificSystemBarEnabled() as well made the system hide the status bar and then
-      // immediately re-enable it (sceneboard logs "isEnable changed: false, immersive is true"
-      // followed 70ms later by "isEnable changed: true, immersive is false"), so those calls are
-      // deliberately left out.
-      try {
-        win.setImmersiveModeEnabledState(true);
-        hilog.info(DOMAIN, 'SDL/STARTUP', 'immersive mode enabled');
-      } catch (err) {
-        hilog.error(DOMAIN, 'SDL/STARTUP', 'setImmersiveModeEnabledState failed: %{public}s', JSON.stringify(err));
-      }
-
-      win.setWindowLayoutFullScreen(true).then(() => {
-        hilog.info(DOMAIN, 'SDL/STARTUP', 'layout is full screen');
-      }).catch((err: Error) => {
-        hilog.error(DOMAIN, 'SDL/STARTUP', 'setWindowLayoutFullScreen failed: %{public}s', err.message);
-      });
+      // 1. Let the layout cover the whole display first...
+      win.setWindowLayoutFullScreen(true)
+        .then(() => {
+          hilog.info(DOMAIN, 'SDL/STARTUP', 'layout is full screen');
+          // 2. ...then hide the bars. This must be the last of the two, because
+          //    setWindowLayoutFullScreen() is what brings them back.
+          return win.setWindowSystemBarEnable([]);
+        })
+        .then(() => {
+          hilog.info(DOMAIN, 'SDL/STARTUP', 'system bars hidden');
+        })
+        .catch((err: Error) => {
+          hilog.error(DOMAIN, 'SDL/STARTUP', 'immersive setup failed: %{public}s', err.message);
+        });
     }).catch((err: Error) => {
       hilog.error(DOMAIN, 'SDL/STARTUP', 'getLastWindow failed: %{public}s', err.message);
     });

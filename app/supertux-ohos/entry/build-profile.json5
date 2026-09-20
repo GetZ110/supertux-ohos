@@ -5,16 +5,12 @@
       "copyCodeResource": {
         "enable": false
       }
-    },
-    "externalNativeOptions": {
-      "path": "./src/main/cpp/CMakeLists.txt",
-      "arguments": "-DCMAKE_PLATFORM_NO_VERSIONED_SONAME=1",   // Otherwise, we load SDL3's data segment twice.  :(
-      "cppFlags": "",
-      "abiFilters": [
-        "arm64-v8a",
-        "x86_64"
-      ]
     }
+    // No externalNativeOptions here on purpose. This HAP ships pre-built native libraries:
+    // scripts/build-supertux-hap.sh copies libmain.so and its dependencies into entry/libs/arm64-v8a,
+    // and hvigor packages them from there (the ProcessLibs task). An externalNativeOptions block
+    // would make hvigor run its own CMake configure against a source tree that does not exist here
+    // (the cross-build happens outside hvigor, against build/ohos-prefix).
   },
   "buildOptionSet": [
     {

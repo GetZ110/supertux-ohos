@@ -4,7 +4,7 @@
     // provisioning profile is issued per bundle name and the device checks them against each
     // other. If you use a different name, change it here and pass -BundleName to
     // scripts/build-supertux-hap.ps1.
-    "bundleName": "com.example.supertux2",
+    "bundleName": "com.supertux.game",
     "vendor": "supertux",
     "versionCode": 1000000,
     "versionName": "0.7.0",
