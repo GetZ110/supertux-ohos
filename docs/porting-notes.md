@@ -86,7 +86,7 @@ native 库走 `entry/libs/arm64-v8a/` 预编译入库，不启用 hvigor 的 CMa
 
 1. 让 SDL 切 fullscreen（把 OHOS 也默认成 true）——**不可行**：状态栏确实被关掉了，但 SDL
    自己的 FIXME（"make sure this causes an XComponent resize event"）导致 surface 没重算，
-   画面被旋转/挤成一条竖条（失败截图 `signing/supertux-fullscreen.jpeg`）。
+   画面被旋转/挤成一条竖条（当时留了截图，未随仓库发布）。
 2. **从 ArkTS 侧处理（采用）**：`window.getLastWindow()` →
    `setWindowLayoutFullScreen(true)` + `setImmersiveModeEnabledState(true)`。
    SuperTux 保持窗口模式不动几何。

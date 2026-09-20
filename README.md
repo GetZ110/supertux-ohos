@@ -5,7 +5,7 @@
 > **非官方社区移植。** 与华为、开放原子开源基金会、SuperTux 开发团队均无隶属或背书关系。
 > HarmonyOS / OpenHarmony 是其各自所有者的商标，此处仅作描述性使用。详见 [NOTICE](NOTICE)。
 
-![SuperTux 在鸿蒙上的标题画面](docs/images/supertux-title.jpeg)
+> 🚧 **仍在开发中。** 下面的「已知问题」里还有几项没解决，行为、坐标与产物都可能变动。
 
 ## 现状
 
@@ -13,7 +13,7 @@
 |---|---|
 | ✅ | 交叉编译 → 打包 HAP → 签名 → 安装 → 启动，全链路在真机跑通 |
 | ✅ | 标题画面 / 主菜单正常渲染，横屏铺满整屏（2720×1260） |
-| ✅ | 输入可用：`uinput` 注入方向键 + 回车，菜单进入 "Installed Add-ons"（见 [截图](docs/images/supertux-input-works.jpeg)） |
+| ✅ | 输入可用：`uinput` 注入方向键 + 回车，菜单能正常跳转 |
 | ✅ | 资源加载：`data.zip` 从 HAP 的 rawfile 解包到应用沙箱，由 PhysFS 挂载 |
 | ✅ | 日志走 hilog（SuperTux 的日志流已接到 `SDL_Log`） |
 | ⚠️ | 触摸落点还差一个状态栏/导航栏高度偏移（机制已通，坐标偏上约 100px） |
@@ -62,8 +62,7 @@ supertux-ohos/
 │                             entry/libs 与 rawfile/data.zip 由脚本生成，不入库
 ├── docs/
 │   ├── porting-notes.md      移植方案 + 实施结果 + 踩过的坑（含日志证据）
-│   ├── signing-howto.md      AGC 调试证书 / Profile / 本地签名步骤
-│   └── images/               真机截图
+│   └── signing-howto.md      AGC 调试证书 / Profile / 本地签名步骤
 ├── patches/
 │   ├── supertux-ohos.patch   SuperTux 侧改动
 │   └── sdl-ohos.patch        SDL 侧本地改动
