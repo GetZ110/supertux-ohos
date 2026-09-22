@@ -341,15 +341,35 @@ SUPERTUX_OHOS_KEY_PWD environment variable. See docs/signing-howto.md."
                -keystoreFile "$KEYSTORE" -keystorePwd "$KEY_PWD"
                -compatibleVersion "$COMPAT_VERSION" -signCode 1)
 
+    # Drop any HAP from an earlier run first: sign-app removes/empties its output
+    # file when it fails, and a leftover entry-default-signed.hap would otherwise
+    # be installed below as if it were this build. See the sign failure check.
+    rm -f "$SIGNED"
+
+    sign_rc=0
     if have "$SIGN_TOOL_BIN"; then
-        "$SIGN_TOOL_BIN" sign-app "${sign_args[@]}" 2>&1 | tail -4
+        "$SIGN_TOOL_BIN" sign-app "${sign_args[@]}" 2>&1 | tail -4 || sign_rc=$?
     elif have "$SIGN_TOOL_JAR"; then
-        java -jar "$SIGN_TOOL_JAR" sign-app "${sign_args[@]}" 2>&1 | tail -4
+        java -jar "$SIGN_TOOL_JAR" sign-app "${sign_args[@]}" 2>&1 | tail -4 || sign_rc=$?
     else
         fail "hap-sign-tool not found (looked for $SIGN_TOOL_BIN and $SIGN_TOOL_JAR)"
     fi
 
-    have "$SIGNED" && echo "signed HAP: $(mbsize "$(stat -c%s "$SIGNED")")"
+    # `| tail` reports tail's status, so judge by the output file. Without this the
+    # failure was silent and step 4 went on to install a stale HAP from a previous
+    # run (or the unsigned one), which made a broken signing setup look like a
+    # successful build + install.
+    if [ "$sign_rc" -ne 0 ] || ! have "$SIGNED"; then
+        fail "hap-sign-tool failed to sign $UNSIGNED
+       (no $SIGNED was produced)
+
+The usual cause is a key alias that does not match the keystore: hap-sign-tool reports
+'key is NULL, get signer failed' when the alias is wrong. KEY_ALIAS defaults to
+'debugKey'; pass --key-alias <alias> for your keystore (this machine's sdl3demo.p12
+uses 'sdl3demo')."
+    fi
+
+    echo "signed HAP: $(mbsize "$(stat -c%s "$SIGNED")")"
 fi
 
 # ------------------------------------------------------------------- 4. install/run
