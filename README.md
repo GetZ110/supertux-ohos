@@ -17,7 +17,7 @@
 | ✅ | 资源加载：`data.zip` 从 HAP 的 rawfile 解包到应用沙箱，由 PhysFS 挂载 |
 | ✅ | 日志走 hilog（SuperTux 的日志流已接到 `SDL_Log`） |
 | ✅ | 音频可用：`patches/openal-ohos-sdl3.patch` 给 OpenAL Soft 加了 SDL3→OHAudio 输出后端 |
-| ⚠️ | 触摸落点还差一个状态栏/导航栏高度偏移（机制已通，坐标偏上约 100px） |
+| ✅ | 触摸落点精确（2026-09 复测：`to_logical()` 实测值与理论值完全吻合；旧文档里的"偏上约 100px"系窗口还是 2720×1046 时的结论，已过时） |
 | ⚠️ | 方向键在"按键映射表"路径下不生效（SDL 鸿蒙键映射表把 `KEY_DPAD_DOWN` 映成了非 `SDL_SCANCODE_DOWN`） |
 | ⚠️ | 音乐默认不打包（`data.zip` 排除 145 MB 的 `music/`，需加 `--include-music`；菜单本身不放音效） |
 

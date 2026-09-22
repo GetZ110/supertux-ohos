@@ -132,11 +132,57 @@ native 库走 `entry/libs/arm64-v8a/` 预编译入库，不启用 hvigor 的 CMa
 菜单本身**不放任何音效**（包里的 90 个 `sounds/` 全是关卡内音效）。
 要听音乐请加 `--include-music`，打包体积约 139 MB → 287 MB。
 
+### 菜单点不中：悬停命中判定没有跟着 `get_distance()` 走（已解决）
+
+**症状**：Options 首页（选 Locale / Video / … 那一屏）点画出来的 `Back` 会进入当前高亮的
+选项（通常是 Locale），必须点 `Back` **上方**一点才能返回。进入各分项后的 `Back` 正常。
+
+根因在 `src/gui/menu.cpp` 的 `SDL_EVENT_MOUSE_MOTION` 分支。它按"菜单左上角 + 累加高度"
+推算鼠标落在哪个 item 上，但 `Menu::draw()` 的布局是
+`get_distance() + get_height() + get_distance()`：
+
+```cpp
+// Menu::draw()  —— 画的时候
+y_pos += m_items[i]->get_distance();
+draw_item(context, i, y_pos + m_items[i]->get_height()/2);
+y_pos += m_items[i]->get_height() + m_items[i]->get_distance();
+
+// Menu::event() —— 判定的时候（修复前）
+item_y += m_items[i]->get_height();   // 少了 get_distance()
+```
+
+`MenuItem::get_distance()` 默认 0，全仓库**只有 `ItemHorizontalMenu` 覆写成 10.f**。
+所以每经过它一次，后面所有 item 的命中带就整体上移 `2 × 10 = 20` 逻辑像素。
+Options 首页正好是 `label / hl / ItemHorizontalMenu / hl / Back`，于是 `Back` 的命中带
+（上移后的 405.9..429.9）和它**画出来的位置**（中心 437.9，字形约 425.9..449.9）几乎不重叠：
+点画出来的中心会落到所有 item 之外的空白，`new_active_item` 保持初值 0（label，skippable），
+活动项于是留在上面那个图标行上，`HIT` 就进去当前高亮的那个分类（一般是 Locale）；
+往上挪 20px 才落进 `Back` 真正的命中带——这正是"要点 `Back` 上面一点"的来源。
+
+对照实验（同一屏，点画出来的 `Back` 中心 1355,872）：点下去进的是 Locale，符合
+"命中带偏移"的推断；各分项菜单没有 `ItemHorizontalMenu`，无累积误差，所以只有首页有问题。
+
+修法：让 `Menu::event()` 的累加与 `Menu::draw()` 完全一致，前后各加一次 `get_distance()`：
+
+```cpp
+item_y += m_items[i]->get_distance();
+if (y >= item_y && y <= item_y + m_items[i]->get_height()) { new_active_item = i; break; }
+item_y += m_items[i]->get_height() + m_items[i]->get_distance();
+```
+
+真机验证：点画出来的 `Back`（1355,872）能正常返回上一层 ✓。
+
+> 顺带记一个"看着像 bug 其实不是"的点：`SDL_EVENT_MOUSE_BUTTON_DOWN` 分支用的是
+> `ev.motion.x/y` 而不是 `ev.button.x/y`。SDL3 里两个结构体在 `x`/`y` 上的偏移恰好都是
+> 28/32，所以能跑对；换 SDL 版本时值得留意。
+
 ## 0.4 已知遗留
 
-- **触摸坐标**：`uinput` 的屏幕坐标 → SDL 归一化坐标之间还有状态栏/导航栏偏移
-  （SuperTux 看到的窗口是 2720x1046，而屏幕是 2720x1260），点击落点会偏上约 100px。
-  机制本身是通的（finger → SuperTux 合成 mouse-button 事件已确认到达），只需校正偏移。
+- ~~**触摸坐标**：状态栏/导航栏偏移，点击落点偏上约 100px~~ —— **已不成立**。这条是窗口还是
+  2720×1046 时的结论；现在窗口铺满 2720×1260，`m_rect.top/left = 0`、`m_scale = 2720/1368 = 1.9883`，
+  实测 tap 设备坐标 872/1355 对应 `to_logical()` 的 438.56/681.49，与理论值
+  `设备坐标 / 1.9883` **逐位吻合**，没有偏移。菜单点不中另有原因，见上面
+  "菜单点不中：悬停命中判定没有跟着 `get_distance()` 走"。
 - **DPAD 键码**：SDL 的 OHOS 键映射把 `KEY_DPAD_DOWN` 映射成了非 `SDL_SCANCODE_DOWN` 的键码
   （日志里 key=0x40000080），所以方向键在"按键映射表"路径下不生效；但菜单路径走的是
   `process_menu_key_event()` 里的 `SDLK_DOWN` 硬编码分支，需要 SDL 侧键映射修正才能完全对齐。
