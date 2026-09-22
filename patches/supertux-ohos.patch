@@ -46,35 +46,273 @@ index 93ffb84e2..4b1d50c8c 100644
  set_target_properties(supertux2 PROPERTIES COMPILE_FLAGS "${SUPERTUX2_EXTRA_WARNING_FLAGS}")
  
  # FIXME: As of writing, Emscripten fails with "wasm-ld: error: /path/to/emsdk/upstream/emscripten/cache/sysroot/lib/wasm32-emscripten/thinlto/libc.a(fileno.o): attempt to add bitcode file after LTO (fileno)"
+diff --git a/src/addon/addon_manager.hpp b/src/addon/addon_manager.hpp
+index 7f108665a..3f4227f85 100644
+--- a/src/addon/addon_manager.hpp
++++ b/src/addon/addon_manager.hpp
+@@ -60,7 +60,17 @@ public:
+ 
+   void empty_cache_directory();
+ 
+-  inline bool has_online_support() const { return true; }
++  // NETWORKING is only defined when libcurl was found and ENABLE_NETWORKING is on
++  // (see config.h). A build without it must not advertise downloads it can never
++  // perform -- Downloader::download() throws "Networking is disabled" -- which is
++  // what made the language menu pop an error dialog on every non-English choice.
++  inline bool has_online_support() const {
++#ifdef NETWORKING
++    return true;
++#else
++    return false;
++#endif
++  }
+   inline bool has_been_updated() const { return m_has_been_updated; }
+   void check_online();
+   TransferStatusPtr request_check_online();
 diff --git a/src/gui/menu.cpp b/src/gui/menu.cpp
-index e178bae40..e30fa6fb9 100644
+index e178bae40..2ed79030b 100644
 --- a/src/gui/menu.cpp
 +++ b/src/gui/menu.cpp
-@@ -703,15 +703,23 @@ Menu::event(const SDL_Event& ev)
-         int new_active_item = 0;
-         // This is probably not the most efficient way of finding active item
-         // but I can't think of something better right now ~ mrkubax10
-+        //
-+        // The cursor has to advance exactly like Menu::draw() does, otherwise the
-+        // clickable bands drift away from where the items are painted. That only shows
-+        // up on items with a non-zero get_distance(): ItemHorizontalMenu (the options
-+        // category icon row) adds 10px above and below itself, so every item below it
-+        // on the options home page was hit-tested 20px too high -- tapping the drawn
-+        // "Back" missed it entirely and activated the highlighted category instead.
-         float item_y = m_pos.y - get_height()/2;
-         for (unsigned i = 0; i < m_items.size(); i++)
+@@ -60,6 +60,10 @@ static const float HELP_MARGIN_Y = 16.f;
+ // The amount in pixels the mouse has to wiggle after scrolling before it can hover over things again.
+ constexpr int MOUSE_DEADZONE_AMOUNT = 70;
+ 
++// How far a finger may travel (in logical pixels) before a touch press counts as a
++// drag instead of a tap. Below this the press still selects the item it landed on.
++constexpr float TOUCH_DRAG_THRESHOLD = 16.0f;
++
+ constexpr int ACTIVE_ITEM_NONE = -1;
+ 
+ Menu::Menu() :
+@@ -74,7 +78,12 @@ Menu::Menu() :
+   m_arrange_left(0),
+   m_active_item(ACTIVE_ITEM_NONE),
+   m_mouse_deadzone(0),
+-  m_can_click_when_unfocused(false)
++  m_can_click_when_unfocused(false),
++  m_touch_pressed(false),
++  m_touch_dragging(false),
++  m_touch_start_y(0.0f),
++  m_touch_last_y(0.0f),
++  m_scroll_offset(0.0f)
+ {
+ }
+ 
+@@ -443,6 +452,41 @@ Menu::process_action(const MenuAction& action)
+     menu_action(*m_items[m_active_item]);
+ }
+ 
++int
++Menu::item_at(float y) const
++{
++  float item_y = m_pos.y - get_height() / 2.0f + m_scroll_offset;
++  for (unsigned int i = 0; i < m_items.size(); ++i)
++  {
++    item_y += m_items[i]->get_distance();
++    if (y >= item_y && y <= item_y + static_cast<float>(m_items[i]->get_height()))
++      return static_cast<int>(i);
++    item_y += static_cast<float>(m_items[i]->get_height()) + m_items[i]->get_distance();
++  }
++  return -1;
++}
++
++void
++Menu::scroll_by(float dy)
++{
++  // Clamp so the list cannot be dragged past its own ends: the content's top may
++  // come down to the top of the screen and its bottom up to the bottom. When the
++  // menu already fits on screen the two limits cross over and there is nothing to
++  // scroll.
++  const float half = get_height() / 2.0f;
++  const float min_offset = static_cast<float>(SCREEN_HEIGHT) - m_pos.y - half;
++  const float max_offset = half - m_pos.y;
++  if (min_offset >= max_offset)
++  {
++    m_scroll_offset = 0.0f;
++    return;
++  }
++
++  m_scroll_offset += dy;
++  if (m_scroll_offset < min_offset) m_scroll_offset = min_offset;
++  if (m_scroll_offset > max_offset) m_scroll_offset = max_offset;
++}
++
+ void
+ Menu::draw_item(DrawingContext& context, int index, float y_pos)
+ {
+@@ -536,7 +580,7 @@ void
+ Menu::draw(DrawingContext& context)
+ {
+   const float menu_height = get_height();
+-  float y_pos = m_pos.y - menu_height / 2.0f;
++  float y_pos = m_pos.y - menu_height / 2.0f + m_scroll_offset;
+   for (unsigned int i = 0; i < m_items.size(); ++i)
+   {
+     y_pos += m_items[i]->get_distance();
+@@ -669,12 +713,48 @@ Menu::event(const SDL_Event& ev)
+ 
+       if ((mouse_pos.x > m_pos.x - get_width() / 2.0f &&
+            mouse_pos.x < m_pos.x + get_width() / 2.0f &&
+-           mouse_pos.y > m_pos.y - get_height() / 2.0f &&
+-           mouse_pos.y < m_pos.y + get_height() / 2.0f) ||
++           mouse_pos.y > m_pos.y - get_height() / 2.0f + m_scroll_offset &&
++           mouse_pos.y < m_pos.y + get_height() / 2.0f + m_scroll_offset) ||
+           m_mouse_deadzone > 0 ||
+           m_can_click_when_unfocused)
+       {
+-        process_action(MenuAction::HIT);
++        if (ev.button.which == SDL_TOUCH_MOUSEID)
++        {
++          // A touch press does not pick anything yet: acting here would select
++          // whatever the finger happened to land on, so dragging a list too long
++          // for the screen would change the setting instead of scrolling. The
++          // decision is made in SDL_EVENT_MOUSE_BUTTON_UP instead.
++          m_touch_pressed = true;
++          m_touch_dragging = false;
++          m_touch_start_y = mouse_pos.y;
++          m_touch_last_y = mouse_pos.y;
++        }
++        else
++        {
++          process_action(MenuAction::HIT);
++        }
++      }
++    }
++    break;
++
++    case SDL_EVENT_MOUSE_BUTTON_UP:
++    if (ev.button.button == SDL_BUTTON_LEFT && m_touch_pressed)
++    {
++      const bool was_dragging = m_touch_dragging;
++      Vector mouse_pos = VideoSystem::current()->get_viewport().to_logical(ev.motion.x, ev.motion.y);
++      m_touch_pressed = false;
++      m_touch_dragging = false;
++
++      // A tap picks the item the finger is on. A drag only scrolled and picks
++      // nothing -- otherwise a scroll would always land on some entry.
++      if (!was_dragging)
++      {
++        const int tapped = item_at(mouse_pos.y);
++        if (tapped >= 0 && !m_items[tapped]->skippable())
++        {
++          set_active_item(tapped);
++          process_action(MenuAction::HIT);
++        }
+       }
+     }
+     break;
+@@ -695,27 +775,49 @@ Menu::event(const SDL_Event& ev)
+       float x = mouse_pos.x;
+       float y = mouse_pos.y;
+ 
+-      if (x > m_pos.x - get_width()/2 &&
+-         x < m_pos.x + get_width()/2 &&
+-         y > m_pos.y - get_height()/2 &&
+-         y < m_pos.y + get_height()/2)
++      if (ev.motion.which == SDL_TOUCH_MOUSEID)
+       {
+-        int new_active_item = 0;
+-        // This is probably not the most efficient way of finding active item
+-        // but I can't think of something better right now ~ mrkubax10
+-        float item_y = m_pos.y - get_height()/2;
+-        for (unsigned i = 0; i < m_items.size(); i++)
++        // Touch never hovers. The hover hit-test below moves the highlight to
++        // whatever the finger is over, which for a drag means re-selecting on
++        // every move and the list jumping around; the selection is changed by a
++        // tap in SDL_EVENT_MOUSE_BUTTON_UP instead.
++        if (m_touch_pressed)
          {
-+          item_y += m_items[i]->get_distance();
-           if (y >= item_y && y <= item_y + static_cast<float>(m_items[i]->get_height()))
+-          if (y >= item_y && y <= item_y + static_cast<float>(m_items[i]->get_height()))
++          const float dy = y - m_touch_last_y;
++          m_touch_last_y = y;
++
++          if (!m_touch_dragging &&
++              (y > m_touch_start_y + TOUCH_DRAG_THRESHOLD ||
++               y < m_touch_start_y - TOUCH_DRAG_THRESHOLD))
            {
-             new_active_item = i;
-             break;
+-            new_active_item = i;
+-            break;
++            m_touch_dragging = true;
++          }
++
++          if (m_touch_dragging)
++          {
++            scroll_by(dy);
            }
 -          item_y += static_cast<float>(m_items[i]->get_height());
-+          item_y += static_cast<float>(m_items[i]->get_height()) + m_items[i]->get_distance();
          }
++        return;
++      }
++
++      if (x > m_pos.x - get_width()/2 &&
++         x < m_pos.x + get_width()/2 &&
++         y > m_pos.y - get_height()/2 + m_scroll_offset &&
++         y < m_pos.y + get_height()/2 + m_scroll_offset)
++      {
++        // item_at() walks the items exactly like Menu::draw() does, otherwise the
++        // clickable bands drift away from where the items are painted. That only
++        // shows up on items with a non-zero get_distance(): ItemHorizontalMenu
++        // (the options category icon row) adds 10px above and below itself, so
++        // every item below it on the options home page was hit-tested 20px too
++        // high -- tapping the drawn "Back" missed it entirely and activated the
++        // highlighted category instead.
++        const int new_active_item = item_at(y);
  
          /* only change the mouse focus to a selectable item */
+-        if (!m_items[new_active_item]->skippable() &&
++        if (new_active_item >= 0 &&
++            !m_items[new_active_item]->skippable() &&
+             new_active_item != m_active_item) {
+ 
+           set_active_item(new_active_item);
+@@ -756,6 +858,13 @@ Menu::set_active_item(int item_idx)
+   if (item_idx == m_active_item)
+     return;
+ 
++  // Selecting something goes back to the list position derived from the active
++  // item in process_action(), so drop whatever offset a touch drag left behind.
++  // This has to happen here rather than in process_action(), which
++  // MenuManager::process_input() calls every frame with MenuAction::NONE -- doing
++  // it there wiped the offset as fast as a drag could add to it.
++  m_scroll_offset = 0.0f;
++
+   if (m_active_item > -1)
+   {
+     process_action(MenuAction::UNSELECT);
+diff --git a/src/gui/menu.hpp b/src/gui/menu.hpp
+index 7ef529a3c..3baa4f63b 100644
+--- a/src/gui/menu.hpp
++++ b/src/gui/menu.hpp
+@@ -162,6 +162,10 @@ private:
+   void recalculate_position_and_size();
+   void check_controlfield_change_event(const SDL_Event& event);
+   void draw_item(DrawingContext& context, int index, float y_pos);
++  /** Index of the item drawn at logical y, or -1 if y is between items. */
++  int item_at(float y) const;
++  /** Offset the item list by dy for a touch drag, clamped to the content. */
++  void scroll_by(float dy);
+ 
+ private:
+   /** position of the menu (ie. center of the menu, not top/left) */
+@@ -176,6 +180,18 @@ private:
+   int m_mouse_deadzone;
+   bool m_can_click_when_unfocused;
+ 
++  /* Touch input state. A touch never moves the selection by itself -- it only
++     scrolls the list -- and a tap (a press lifted without dragging) selects the
++     item under the finger. Without this the hover hit-test moved the highlight to
++     whatever the finger touched, so a drag to scroll re-selected on every move. */
++  bool m_touch_pressed;
++  bool m_touch_dragging;
++  float m_touch_start_y;
++  float m_touch_last_y;
++  /** Extra vertical offset of the item list, moved by touch drags. Applied on top
++      of m_pos.y, which the keyboard/mouse scroll logic keeps recomputing. */
++  float m_scroll_offset;
++
+ public:
+   std::vector<std::unique_ptr<MenuItem> > m_items;
+ 
 diff --git a/src/ohos/main_ohos.cpp b/src/ohos/main_ohos.cpp
 new file mode 100644
 index 000000000..c795cacc9
@@ -204,6 +442,128 @@ index 000000000..c795cacc9
 +}
 +
 +} // extern "C"
+diff --git a/src/physfs/physfs_sdl.cpp b/src/physfs/physfs_sdl.cpp
+index 723564fb6..69afe0a1f 100644
+--- a/src/physfs/physfs_sdl.cpp
++++ b/src/physfs/physfs_sdl.cpp
+@@ -25,8 +25,10 @@
+ #include "util/log.hpp"
+ 
+ #include <iostream>
++#include <map>
+ #include <sstream>
+ #include <stdexcept>
++#include <vector>
+ #include <assert.h>
+ #include <stdio.h>
+ 
+@@ -167,6 +169,78 @@ SDL_IOStream* get_physfs_SDLRWops(const std::string& filename)
+   return SDL_OpenIO(&iface, (void*)file);
+ }
+ 
++namespace {
++
++/* Font buffers handed out by get_physfs_SDLRWops_memory(). Keyed by filename so
++   that several languages mapping to the same font file (cmn/ja/zh_CN/zh_TW all
++   use NotoSansCJKjp-Medium.otf) share one copy. Never evicted: SuperTux's fonts
++   are a handful of files, and the alternative -- re-inflating a 13.9 MB zip
++   entry per lookup -- is what this exists to avoid. */
++std::map<std::string, std::vector<PHYSFS_uint8>>&
++memory_file_cache()
++{
++  static std::map<std::string, std::vector<PHYSFS_uint8>> cache;
++  return cache;
++}
++
++} // namespace
++
++SDL_IOStream* get_physfs_SDLRWops_memory(const std::string& filename)
++{
++  if (filename.empty()) {
++    throw std::runtime_error("Couldn't open file: empty filename");
++  }
++
++  auto& cache = memory_file_cache();
++  auto it = cache.find(filename);
++  if (it == cache.end())
++  {
++    PHYSFS_file* file = static_cast<PHYSFS_file*>(PHYSFS_openRead(filename.c_str()));
++    if (!file) {
++      std::stringstream msg;
++      msg << "Couldn't open '" << filename << "': "
++          << physfsutil::get_last_error();
++      throw std::runtime_error(msg.str());
++    }
++
++    const PHYSFS_sint64 length = PHYSFS_fileLength(file);
++    if (length < 0) {
++      PHYSFS_close(file);
++      std::stringstream msg;
++      msg << "Couldn't size '" << filename << "': "
++          << physfsutil::get_last_error();
++      throw std::runtime_error(msg.str());
++    }
++
++    std::vector<PHYSFS_uint8> data(static_cast<size_t>(length));
++    if (length > 0) {
++      const PHYSFS_sint64 got = PHYSFS_readBytes(file, data.data(), static_cast<PHYSFS_uint64>(length));
++      if (got != length) {
++        PHYSFS_close(file);
++        std::stringstream msg;
++        msg << "Couldn't read '" << filename << "': "
++            << physfsutil::get_last_error();
++        throw std::runtime_error(msg.str());
++      }
++    }
++    PHYSFS_close(file);
++
++    it = cache.emplace(filename, std::move(data)).first;
++  }
++
++  auto& data = it->second;
++  if (data.empty()) {
++    throw std::runtime_error("Couldn't open file: '" + filename + "' is empty");
++  }
++
++  SDL_IOStream* stream = SDL_IOFromMem(data.data(), data.size());
++  if (!stream) {
++    throw std::runtime_error("Couldn't create a memory stream for '" + filename +
++                             "': " + SDL_GetError());
++  }
++  return stream;
++}
++
+ SDL_IOStream* get_writable_physfs_SDLRWops(const std::string& filename)
+ {
+   // check this as PHYSFS seems to be buggy and still returns a
+diff --git a/src/physfs/physfs_sdl.hpp b/src/physfs/physfs_sdl.hpp
+index 8c3064f82..49056accb 100644
+--- a/src/physfs/physfs_sdl.hpp
++++ b/src/physfs/physfs_sdl.hpp
+@@ -26,4 +26,23 @@
+ 
+     See: https://wiki.libsdl.org/SDL_RWclose */
+ SDL_IOStream* get_physfs_SDLRWops(const std::string& filename);
++
++/** Same as get_physfs_SDLRWops(), except that the file is read into memory first
++    and the returned stream seeks inside that buffer.
++
++    Needed because PhysFS cannot seek within a deflate-compressed zip entry: a
++    backwards seek rewinds the entry and re-inflates it up to the target offset
++    (physfs_archiver_zip.c, ZIP_seek()). FreeType opens a font by seeking to the
++    sfnt table directory and then back to each table, so loading a font straight
++    out of the compressed data.zip costs one full re-inflation per backwards seek
++    -- measured at 3.3 s for the 16.5 MB NotoSansCJKjp-Medium.otf. LanguageMenu
++    builds a TTFFont for every language that needs a custom font, and cmn, ja,
++    zh_CN and zh_TW all map to that one file, so the menu spent ~14 s on the main
++    thread and HarmonyOS's watchdog killed the app (THREAD_BLOCK_6S + SIGKILL).
++
++    Buffers are cached per filename, so those four languages share a single copy
++    instead of decompressing the file four times. The stream does not own the
++    buffer; the cache keeps it alive for the lifetime of the process. */
++SDL_IOStream* get_physfs_SDLRWops_memory(const std::string& filename);
++
+ SDL_IOStream* get_writable_physfs_SDLRWops(const std::string& filename);
 diff --git a/src/supertux/gameconfig.cpp b/src/supertux/gameconfig.cpp
 index 9d88e52fb..e5eb8d21e 100644
 --- a/src/supertux/gameconfig.cpp
@@ -581,8 +941,77 @@ index 9fde8ae99..3f237071a 100644
    void init_tinygettext();
    void init_video();
  
+diff --git a/src/supertux/menu/language_menu.cpp b/src/supertux/menu/language_menu.cpp
+index 317279bda..93d28cc22 100644
+--- a/src/supertux/menu/language_menu.cpp
++++ b/src/supertux/menu/language_menu.cpp
+@@ -50,9 +50,21 @@ LanguageMenu::LanguageMenu()
+   // see `static const LanguageSpec languages[]`
+   int mnid = MNID_LANGUAGE_NEXT;
+   auto languages = g_dictionary_manager->get_languages();
++
++  // Remember which entry is the language already in use, so the menu opens with
++  // the highlight on it instead of always jumping back to <auto-detect>. That
++  // matters on this port because the list is long and has to be dragged to be
++  // read: without it there is no way to tell what is currently selected.
++  const tinygettext::Language current = g_dictionary_manager->get_language();
++  int current_language_id = -1;
++
+   for (auto& lang : languages)
+   {
+-    auto& item = add_entry(mnid++, lang.get_localized_name());
++    auto& item = add_entry(mnid, lang.get_localized_name());
++    if (lang == current)
++    {
++      current_language_id = mnid;
++    }
+     auto font = Resources::default_font;
+     if(Resources::needs_custom_font(lang))
+     {
+@@ -60,10 +72,27 @@ LanguageMenu::LanguageMenu()
+       font = std::make_shared<TTFFont>(font_path, 18, 1.25f, 2, 1);
+     }
+     item.set_font(font);
++    ++mnid;
+   }
+ 
+   add_hl();
+   add_back(_("Back"));
++
++  // English has its own fixed entry rather than coming from the .po list, and a
++  // language this build has no .po for (or no detected one at all) falls back to
++  // <auto-detect>.
++  if (current_language_id >= 0)
++  {
++    set_active_item_id(current_language_id);
++  }
++  else if (current.get_language() == "en")
++  {
++    set_active_item_id(MNID_LANGUAGE_ENGLISH);
++  }
++  else
++  {
++    set_active_item_id(MNID_LANGUAGE_AUTO_DETECT);
++  }
+ }
+ 
+ void
+@@ -110,7 +139,12 @@ LanguageMenu::menu_action(MenuItem& item)
+   if (TitleScreen::current())
+     TitleScreen::current()->refresh_copyright_text();
+ 
+-  if (g_dictionary_manager->get_language().get_language() != "en" &&
++  // The auto-update menu downloads the language pack from the add-on repository,
++  // so it is only worth pushing when this build can actually do that. Without
++  // networking it did nothing but raise a "Networking is disabled" error dialog on
++  // top of the freshly changed language.
++  if (AddonManager::current()->has_online_support() &&
++      g_dictionary_manager->get_language().get_language() != "en" &&
+       !AddonManager::current()->is_addon_installed("language-pack"))
+   {
+     MenuManager::instance().push_menu(MenuStorage::LANGPACK_AUTO_UPDATE_MENU, true);
 diff --git a/src/supertux/screen_manager.cpp b/src/supertux/screen_manager.cpp
-index 6dfb1a131..366e6a24f 100644
+index 6dfb1a131..6b3337303 100644
 --- a/src/supertux/screen_manager.cpp
 +++ b/src/supertux/screen_manager.cpp
 @@ -338,13 +338,109 @@ ScreenManager::update_gamelogic(float dt_sec)
@@ -696,7 +1125,46 @@ index 6dfb1a131..366e6a24f 100644
    {
      auto window_size = m_video_system.get_window_size();
      auto window_width = window_size.width * 1.0f;
-@@ -526,7 +622,6 @@ ScreenManager::process_events()
+@@ -365,9 +461,15 @@ ScreenManager::process_events()
+         event2.button.button = SDL_BUTTON_LEFT;
+         event2.button.x = Sint32(old_event.tfinger.x * window_width);
+         event2.button.y = Sint32(old_event.tfinger.y * window_height);
++        // Mark these as touch-synthesized (same as SDL does for its own touch
++        // mouse emulation): Menu treats them as taps that must not click until the
++        // finger is lifted, so that dragging scrolls a long list instead of
++        // picking whatever it landed on.
++        event2.button.which = SDL_TOUCH_MOUSEID;
+         SDL_PushEvent(&event2);
+ 
+         event.type = SDL_EVENT_MOUSE_MOTION;
++        event.motion.which = SDL_TOUCH_MOUSEID;
+         event.motion.x = event2.button.x;
+         event.motion.y = event2.button.y;
+         MouseCursor::current()->set_pos(event.button.x, event.button.y);
+@@ -385,12 +487,14 @@ ScreenManager::process_events()
+         event2.button.button = SDL_BUTTON_LEFT;
+         event2.button.x = Sint32(old_event.tfinger.x * window_width);
+         event2.button.y = Sint32(old_event.tfinger.y * window_height);
++        event2.button.which = SDL_TOUCH_MOUSEID;
+         SDL_PushEvent(&event2);
+ 
+         if (m_mobile_controller.process_finger_up_event(event.tfinger))
+           break; // Event was processed by touch controls, do not generate mouse event
+ 
+         event.type = SDL_EVENT_MOUSE_MOTION;
++        event.motion.which = SDL_TOUCH_MOUSEID;
+         event.motion.x = event2.button.x;
+         event.motion.y = event2.button.y;
+         MouseCursor::current()->set_pos(event.button.x, event.button.y);
+@@ -404,6 +508,7 @@ ScreenManager::process_events()
+           break; // Event was processed by touch controls, do not generate mouse event
+ 
+         event.type = SDL_EVENT_MOUSE_MOTION;
++        event.motion.which = SDL_TOUCH_MOUSEID;
+         event.motion.x = Sint32(old_event.tfinger.x * window_width);
+         event.motion.y = Sint32(old_event.tfinger.y * window_height);
+         event.motion.xrel = Sint32(old_event.tfinger.dx * window_width);
+@@ -526,7 +631,6 @@ ScreenManager::process_events()
      }
    }
  }
@@ -704,7 +1172,7 @@ index 6dfb1a131..366e6a24f 100644
  bool
  ScreenManager::has_pending_fadeout() const
  {
-@@ -715,11 +810,19 @@ static void g_loop_iter() {
+@@ -715,11 +819,19 @@ static void g_loop_iter() {
  #endif
  
  void
@@ -888,5 +1356,22 @@ index 0dcbe9bc7..8f21a0c08 100644
    m_sdl_window.reset(SDL_CreateWindow("SuperTux", size.width, size.height, flags));
 +#endif
    if (!m_sdl_window)
+   {
+     std::ostringstream msg;
+diff --git a/src/video/ttf_font.cpp b/src/video/ttf_font.cpp
+index 566267a2e..533a458ed 100644
+--- a/src/video/ttf_font.cpp
++++ b/src/video/ttf_font.cpp
+@@ -36,7 +36,11 @@ TTFFont::TTFFont(const std::string& filename, int font_size, float line_spacing,
+   m_shadow_size(shadow_size),
+   m_border(border)
+ {
+-  m_font = TTF_OpenFontIO(get_physfs_SDLRWops(m_filename), 1, font_size);
++  // Load from a memory-backed stream: reading a font straight out of the
++  // compressed data.zip makes PhysFS re-inflate the whole entry on every
++  // backwards seek, and FreeType seeks constantly. See
++  // get_physfs_SDLRWops_memory() for the measurements.
++  m_font = TTF_OpenFontIO(get_physfs_SDLRWops_memory(m_filename), 1, font_size);
+   if (!m_font)
    {
      std::ostringstream msg;

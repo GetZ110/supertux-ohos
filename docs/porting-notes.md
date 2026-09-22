@@ -176,6 +176,90 @@ item_y += m_items[i]->get_height() + m_items[i]->get_distance();
 > `ev.motion.x/y` 而不是 `ev.button.x/y`。SDL3 里两个结构体在 `x`/`y` 上的偏移恰好都是
 > 28/32，所以能跑对；换 SDL 版本时值得留意。
 
+### 语言菜单卡死闪退：压缩 zip 里的字体被反复重解压（已解决）
+
+**症状**：Options → Locale → Select Language 点下去，画面定住约 6 秒，然后应用直接消失 ——
+不是崩溃弹窗，是被系统杀掉。在语言列表里点任何一项也一样，所以语言根本改不了。
+
+**根因**：`LanguageMenu` 构造时会为每个需要"自定义字体"的语言各建一个 `TTFFont`，而
+`Resources::get_font_for_locale()` 把 `cmn / ja / zh_CN / zh_TW` 全指向同一个
+`fonts/NotoSansCJKjp-Medium.otf`。这个文件在 `data.zip` 里是 **deflate 压缩**的 16.5 MB 条目，而
+PhysFS 对压缩条目**无法真正 seek**：`ZIP_seek()` 在 `offset < uncompressed_position` 时会
+`inflateEnd` 后从条目开头重新解压，再按 512 字节一块读到你想要的位置
+（`third_party/deps/physfs/src/physfs_archiver_zip.c` 的 395-434 行）。FreeType 打开字体会先读 sfnt
+表目录、再逐个 seek 回去读表，于是"打开一次字体"要把整个条目从头重解压几十遍。
+
+加计时探针后的真机日志（Mate 60 Pro，hilog）：
+
+```
+LANGMENU get_languages: 0 ms (60 langs)
+LANGMENU   font fonts/NotoSansCJKjp-Medium.otf (cmn): 3333 ms
+LANGMENU   font fonts/NotoSansCJKjp-Medium.otf (ja):  3502 ms
+LANGMENU   font fonts/MapoBackpacking.ttf       (ko):    32 ms
+... 四个 CJK 语言合计 ~14 s
+```
+
+主线程被占住 6 秒以上，鸿蒙 `AppDfr` 依次报 `THREAD_BLOCK_3S` → `THREAD_BLOCK_6S` →
+`APP_INPUT_BLOCK`，最后 `PROCESS_KILL ... reason=THREAD_BLOCK_6S`（`appspawn` 侧
+`exit with signal:9`）。**"闪退"是看门狗强杀，不是段错误** —— 这一点很关键，一开始按崩溃去查
+faultlog 是查不到的。
+
+**修法**：字体先整份读进内存再交给 SDL_ttf（`get_physfs_SDLRWops_memory()`，
+`src/physfs/physfs_sdl.cpp`），FreeType 之后在内存里随便 seek；缓冲区按文件名缓存，
+四个语言共用一份。修后同一次菜单构造：
+
+```
+LANGMENU get_languages: 0 ms (60 langs)
+LANGMENU   font fonts/NotoSansCJKjp-Medium.otf (cmn): 2 ms
+LANGMENU   font fonts/NotoSansCJKjp-Medium.otf (ja):  2 ms
+... LANGMENU total: 17-19 ms
+```
+
+> 另一条验证过的路：把 `data.zip` 里 `fonts/` 改成 STORED（不压缩），PhysFS 会走直接 seek
+> 分支，3333 ms 同样降到 2 ms；但 HAP 要 +4 MB，而且只治"字体"这一类文件，所以最终选了内存缓冲。
+>
+> 这个对比一度把排查带偏：脚本的 `KEY_ALIAS` 默认是 `debugKey`，和本机密钥库别名 `sdl3demo`
+> 不一致，签名报 `-105 ... GetSigner: key is NULL`，而脚本**照样继续安装上一次留下的旧签名 HAP**，
+> 看起来像"改了没用"。实际跑的一直是旧包（连探针都没打进去）。现在签名失败会直接 `fail` 退出，
+> 见 `scripts/build-supertux-hap.sh` 的 3b 段。
+
+**顺带修掉**：无网络构建（`ENABLE_NETWORKING=OFF`，`config.h` 里没有 `NETWORKING`）下切到非英语语言时，
+`LanguageMenu::menu_action()` 仍会 push `LANGPACK_AUTO_UPDATE_MENU`，它去下载 `index-0_7.nfo`，
+必然抛 `Networking is disabled`，于是刚切好的语言上被盖一个报错框。`AddonManager::has_online_support()`
+原本硬编码 `return true`，现在按 `NETWORKING` 如实返回，push 之前先问它；Add-ons 菜单里的
+"Check Online" 也会正确变成禁用态。
+
+### 触摸下的长菜单：拖动滚动、抬起才算点按（已解决）
+
+**症状**：语言列表有 60 项，一屏放不下；手指一碰就立刻选中手指下面那一项，所以既看不到后面的
+语言，也滚不动 —— 想"滑一下"反而改了语言（一开始还被误当成"有个光标跟着手指跑"）。
+
+**根因**：菜单的命中判定是给鼠标 hover 用的。`ScreenManager::process_event()` 把 `FINGER_DOWN`
+转成 `MOUSE_BUTTON_DOWN` 事件塞回 SDL 队列，`Menu::event()` 收到就 `process_action(HIT)`；
+而 `FINGER_DOWN` 还会顺手生成一个 `MOUSE_MOTION`，`Menu::event()` 里那段 hover 命中逻辑于是把
+高亮移到手指所在项。滚动本身只有鼠标滚轮（`SDL_EVENT_MOUSE_WHEEL`）+ 键盘，触摸一个都没有，
+所以列表长了就没法用。
+
+**修法**（`src/gui/menu.cpp` / `src/supertux/screen_manager.cpp`）：
+
+1. `ScreenManager` 合成鼠标事件时把 `which` 标成 `SDL_TOUCH_MOUSEID`（SDL 自己的触摸鼠标模拟
+   也用它），菜单据此把触摸和真鼠标分开 —— 桌面端行为完全不变。
+2. 触摸**永不做 hover**：`MOUSE_MOTION` 里遇到 `SDL_TOUCH_MOUSEID` 直接走滚动分支，不再动选中项。
+   滚动用独立偏移 `m_scroll_offset`（`scroll_by()` 里按内容上下边夹住），叠加在 `m_pos.y` 上；
+   `draw()` 和 `item_at()` 都算上它，所以画在哪就能点到哪。
+3. `MOUSE_BUTTON_DOWN` 对触摸只记起点，**不选中**；`MOUSE_BUTTON_UP` 时若手指移动没超过
+   `TOUCH_DRAG_THRESHOLD`（16 逻辑像素）才算点按 —— 这时才 `set_active_item()` + `HIT`，
+   而拖动过就什么都不选。
+4. `set_active_item()` 里把 `m_scroll_offset` 清零，让键盘/鼠标重新按"滚动到选中项"定位。
+
+> 这里踩了个坑：一开始把清零放在 `process_action()` 里，结果拖动完全没反应。原因是
+> `MenuManager::process_input()` **每帧**都会调一次 `current_menu()->process_action(NONE)`，
+> 于是偏移刚加上就被下一帧清掉。放在 `set_active_item()` 里才对 —— 它只在选中项真的变化时才走。
+
+**顺带**：`LanguageMenu` 构造完会用 `set_active_item_id()` 把高亮放到当前语言那一项
+（`g_dictionary_manager->get_language()`；英语走固定的 English 项，匹配不到则回落到 `<auto-detect>`）。
+列表会因此自动滚到当前语言，用户一进来就知道现在用的是哪个。
+
 ## 0.4 已知遗留
 
 - ~~**触摸坐标**：状态栏/导航栏偏移，点击落点偏上约 100px~~ —— **已不成立**。这条是窗口还是
@@ -284,9 +368,11 @@ ArkTS 侧（`EntryAbility.ets`）同样改成"先 layout、后 `setWindowSystemB
 
 ## 0.5 下一步
 
-1. 校正触摸坐标偏移（把状态栏/导航栏高度计入，或在 ArkTS 侧用窗口尺寸换算）。
-2. 修 SDL 的 OHOS 键映射表（DPAD 等）。
-3. 为 `com.supertux.game` 建 AGC 调试 Profile，脱离临时复用的 demo 包名。
+1. 修 SDL 的 OHOS 键映射表（DPAD 等）。
+2. 为 `com.supertux.game` 建 AGC 调试 Profile，脱离临时复用的 demo 包名。
+
+> ~~校正触摸坐标偏移~~ 已解决且**无需修改**：窗口铺满 2720×1260 后 `m_rect.top/left = 0`，
+> `to_logical()` 实测值与理论值逐位吻合，见「0.4 已知遗留」。
 
 ---
 
